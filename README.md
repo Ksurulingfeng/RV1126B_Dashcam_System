@@ -156,20 +156,6 @@ gcc -std=c11 -Wall -I src/av -o /tmp/test_thumb_gen \
     && /tmp/test_thumb_gen /tmp/test.mp4 /tmp/test.bmp 320 180
 ```
 
-## 开发进度
-
-- [x] GStreamer 分段录像（splitmuxsink 无缝切文件）
-- [x] 循环覆盖（file_mgr 巡检，_E 锁定保护）
-- [x] NMEA 解析 + GPS 线程（GGA/RMC）
-- [x] AI 目标检测（YOLOv5s RKNN，约 40fps）
-- [x] 紧急录像联动（person 连续 3 帧 + 双重防重复）
-- [x] FFmpeg 缩略图（解码抽帧 + 手写 BMP，PC/板端双验证）
-- [x] LVGL 多页面 UI（主页/录像库/设置 + 触摸交互）
-- [ ] 缩略图接入录像页
-- [ ] 回放功能（FFmpeg 解封装 + h264_rkmpp 硬解）
-- [ ] 车牌识别（LPRNet）
-- [ ] RTSP 推流与 4G 云端
-
 ## 代码规范
 
 C 代码遵循[华为 C 语言编程规范（2011 版）](.claude/CLAUDE.md)（4 空格缩进、snake_case 命名、函数头注释、goto 集中错误处理）。
