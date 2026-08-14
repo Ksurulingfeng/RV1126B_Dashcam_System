@@ -1,0 +1,68 @@
+/*****************************************************************************
+ * Copyright (C) 2026 heifast. All rights reserved.
+ *
+ * 文件名称：gst_encoder.h
+ * 文件功能：GStreamer 录像编码器
+ *           v4l2src → capsfilter → mpph264enc → h264parse → splitmuxsink
+ * 作    者：heifast
+ * 创建日期：2026-08-13
+ *****************************************************************************/
+
+#ifndef GST_ENCODER_H
+#define GST_ENCODER_H
+
+#include <stdint.h>
+
+#include <gst/gst.h>
+
+/* 编码器配置（打包参数，避免超长参数列表） */
+typedef struct {
+    const char *device;       /* 摄像头设备节点，如 "/dev/video-camera0" */
+    const char *dir;          /* 录像输出目录 */
+    uint32_t    segment_sec;  /* 单文件时长（秒），如 300 = 5 分钟 */
+    uint32_t    width;        /* 编码宽度 */
+    uint32_t    height;       /* 编码高度 */
+    uint32_t    fps;          /* 帧率 */
+    uint32_t    bitrate;      /* 码率（bps），如 8000000 */
+} gst_encoder_config_t;
+
+/* 录像编码器上下文 */
+typedef struct {
+    GstElement *pipeline;   /* 编码流水线 */
+    GstBus     *bus;        /* 消息总线（错误/EOS 监控） */
+} gst_encoder_t;
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_init
+ * 功能描述：创建分段录像流水线
+ * 输入参数：@enc    - 编码器上下文
+ *           @config - 编码配置（见 gst_encoder_config_t）
+ * 返回值：  成功返回0，失败返回-1
+ * 注意事项：文件自动命名为 dir/rec_%05d.mp4，序号在已有文件基础上
+ *           递增，重启不会覆盖旧录像
+ *****************************************************************************/
+int gst_encoder_init(gst_encoder_t *enc, const gst_encoder_config_t *config);
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_start
+ * 功能描述：启动流水线，开始采集编码写文件
+ * 输入参数：@enc - 编码器上下文
+ * 返回值：  成功返回0，失败返回-1
+ *****************************************************************************/
+int gst_encoder_start(gst_encoder_t *enc);
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_stop
+ * 功能描述：停止流水线（发 EOS 让最后一个分段正确收尾写索引）
+ * 输入参数：@enc - 编码器上下文
+ *****************************************************************************/
+void gst_encoder_stop(gst_encoder_t *enc);
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_deinit
+ * 功能描述：销毁流水线，释放全部资源
+ * 输入参数：@enc - 编码器上下文
+ *****************************************************************************/
+void gst_encoder_deinit(gst_encoder_t *enc);
+
+#endif /* GST_ENCODER_H */
