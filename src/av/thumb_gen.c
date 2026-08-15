@@ -17,6 +17,7 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 
+#include "log.h"
 #include "thumb_gen.h"
 
 /* BMP 格式常量 */
@@ -104,7 +105,7 @@ static int write_bmp(const char *path, const uint8_t *data, int src_stride,
 
     fp = fopen(path, "wb");
     if (NULL == fp) {
-        fprintf(stderr, "[thumb_gen] 创建缩略图失败: %s\n", path);
+        LOG_E("THUMB", "创建缩略图失败: %s", path);
         return -1;
     }
 
@@ -162,13 +163,13 @@ static int open_video_decode(const char *src_path,
 
     /* ① 打开文件并探测封装格式（MP4/MKV/AVI...） */
     if (0 > avformat_open_input(&fmt_ctx, src_path, NULL, NULL)) {
-        fprintf(stderr, "[thumb_gen] 打开视频失败: %s\n", src_path);
+        LOG_E("THUMB", "打开视频失败: %s", src_path);
         return -1;
     }
 
     /* ② 读部分码流，探测每条流的编码信息 */
     if (0 > avformat_find_stream_info(fmt_ctx, NULL)) {
-        fprintf(stderr, "[thumb_gen] 探测流信息失败\n");
+        LOG_E("THUMB", "探测流信息失败");
         goto error;
     }
 
@@ -176,7 +177,7 @@ static int open_video_decode(const char *src_path,
     stream_idx = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO,
                                      -1, -1, NULL, 0);
     if (0 > stream_idx) {
-        fprintf(stderr, "[thumb_gen] 文件中无视频流\n");
+        LOG_W("THUMB", "文件中无视频流");
         goto error;
     }
 
@@ -184,7 +185,7 @@ static int open_video_decode(const char *src_path,
     codec = avcodec_find_decoder(
         fmt_ctx->streams[stream_idx]->codecpar->codec_id);
     if (NULL == codec) {
-        fprintf(stderr, "[thumb_gen] 找不到对应解码器\n");
+        LOG_E("THUMB", "找不到对应解码器");
         goto error;
     }
 
@@ -198,7 +199,7 @@ static int open_video_decode(const char *src_path,
         goto error;
     }
     if (0 > avcodec_open2(codec_ctx, codec, NULL)) {
-        fprintf(stderr, "[thumb_gen] 打开解码器失败\n");
+        LOG_E("THUMB", "打开解码器失败");
         goto error;
     }
 
@@ -299,7 +300,7 @@ static int scale_to_bgr(const AVFrame *src, AVFrame *dst)
                              dst->width, dst->height, AV_PIX_FMT_BGR24,
                              SWS_BILINEAR, NULL, NULL, NULL);
     if (NULL == sws_ctx) {
-        fprintf(stderr, "[thumb_gen] 创建缩放上下文失败\n");
+        LOG_E("THUMB", "创建缩放上下文失败");
         return -1;
     }
 
@@ -333,7 +334,7 @@ static AVFrame *alloc_rgb_frame(int width, int height)
     frame_rgb->width  = width;
     frame_rgb->height = height;
     if (0 > av_frame_get_buffer(frame_rgb, 32)) {
-        fprintf(stderr, "[thumb_gen] 分配帧内存失败\n");
+        LOG_E("THUMB", "分配帧内存失败");
         av_frame_free(&frame_rgb);
         return NULL;
     }
@@ -366,7 +367,7 @@ int thumb_gen_from_video(const char *src_path, const char *bmp_path,
     if ((NULL == src_path) || (NULL == bmp_path) ||
         (0 >= width) || (0 >= height) ||
         (THUMB_MAX_DIMENSION < width) || (THUMB_MAX_DIMENSION < height)) {
-        fprintf(stderr, "[thumb_gen] 无效参数\n");
+        LOG_E("THUMB", "无效参数");
         return -1;
     }
 
@@ -381,7 +382,7 @@ int thumb_gen_from_video(const char *src_path, const char *bmp_path,
         goto cleanup;
     }
     if (0 != decode_first_frame(fmt_ctx, codec_ctx, stream_idx, frame)) {
-        fprintf(stderr, "[thumb_gen] 解码第一帧失败\n");
+        LOG_W("THUMB", "解码第一帧失败");
         goto cleanup;
     }
 

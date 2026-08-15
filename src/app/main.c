@@ -15,15 +15,32 @@
 #include <unistd.h>
 
 #include "ai_worker.h"
+#include "log.h"
 #include "file_mgr.h"
-#include "frame_share.h"
+#include "detect_share.h"
 #include "gst_encoder.h"
 #include "gps_worker.h"
+#include "preview_share.h"
 #include "thread_mgr.h"
 #include "ui_main.h"
 
+/* 模块启用宏（调试开关，发布时全 1）
+ * 依赖关系：AI 依赖 GST（GStreamer tee 预览分支喂帧）；
+ *           UI 预览依赖 GST（preview_share），AI 仅提供检测框叠加 */
+#define FILE_ON 1
+#define GST_ON  1
+#define GPS_ON  0
+#define AI_ON   0
+#define UI_ON   1
+
+/* 依赖校验：AI 帧源来自 GStreamer 预览分支，关 GST 必须关 AI，
+ * 否则 AI 线程无帧忙等烧 CPU */
+#if AI_ON && !GST_ON
+#error "AI_ON 依赖 GST_ON（GStreamer 预览分支喂帧），两者必须同时启用"
+#endif
+
 /* 摄像头与编码参数 */
-#define CAMERA_DEV    "/dev/video-camera0"
+#define CAMERA_DEV    "/dev/video24"
 #define CAMERA_WIDTH  1920
 #define CAMERA_HEIGHT 1080
 #define CAMERA_FPS    30
@@ -32,7 +49,6 @@
 /* AI 检测参数 */
 #define AI_MODEL_PATH  "/root/RV1126B_Dashcam_System/model/yolov5.rknn"
 #define AI_LABELS_PATH "/root/RV1126B_Dashcam_System/model/coco_80_labels_list.txt"
-#define AI_CAMERA_DEV  "/dev/video24" /* 独立节点，不影响录像 */
 
 /* GPS 串口设备 */
 #define GPS_DEV "/dev/ttyUSB1"
@@ -45,6 +61,18 @@
 /* 系统退出标志（信号处理函数设置） */
 static volatile bool s_is_running = true;
 
+/*****************************************************************************
+ * 函数名称：preview_frame_cb
+ * 功能描述：GStreamer 预览帧回调——NV12 数据写入预览共享缓冲
+ * 输入参数：@nv12      - NV12 帧数据
+ *           @user_data - preview_share_t 指针
+ * 注意事项：在 GStreamer 内部线程执行，仅做锁内拷贝快速返回
+ *****************************************************************************/
+static void preview_frame_cb(const uint8_t* nv12, void* user_data)
+{
+    preview_share_push((preview_share_t*)user_data, nv12);
+}
+
 /* 全局模块实例 */
 static gst_encoder_t s_encoder;
 static file_mgr_t s_file_mgr;
@@ -52,7 +80,8 @@ static gps_worker_t s_gps_worker;
 static ai_worker_t s_ai_worker;
 static ui_worker_t s_ui_worker;
 static thread_mgr_t s_thread_mgr;
-static frame_share_t s_frame_share; /* AI → UI 帧共享 */
+static detect_share_t s_detect_share;   /* AI → UI 检测结果 */
+static preview_share_t s_preview_share; /* GStreamer → AI 预览帧 */
 
 /* 模块初始化完成标志（错误清理时按序释放） */
 static bool s_encoder_ready  = false;
@@ -69,7 +98,6 @@ static void signal_handler(int sig)
     (void)sig;
     s_is_running = false;
 }
-
 
 /*****************************************************************************
  * 函数名称：register_signals
@@ -89,7 +117,6 @@ static int register_signals(void)
     return 0;
 }
 
-
 /*****************************************************************************
  * 函数名称：system_init
  * 功能描述：初始化文件管理器和编码器，注册业务线程
@@ -100,18 +127,20 @@ static int system_init(void)
 {
     int ret = -1;
 
-    /* 帧共享缓冲（AI 写 → UI 读） */
-    frame_share_init(&s_frame_share);
+    /* 跨线程共享数据 */
+    detect_share_init(&s_detect_share);   /* 检测结果共享（AI → UI） */
+    preview_share_init(&s_preview_share); /* 预览帧共享（GStreamer → AI/UI） */
 
-    /* 文件管理器：扫描已有分段文件，恢复锁定状态 */
+#if FILE_ON /* 文件管理器 */
     if (0 != file_mgr_init(&s_file_mgr, RECORD_DIR, MAX_STORAGE)) {
-        fprintf(stderr, "[ERROR] 文件管理器初始化失败\n");
+        LOG_E("MAIN", "文件管理器初始化失败");
         goto cleanup;
     }
     s_file_mgr_ready = true;
-    printf("[INFO] 已有 %d 个录像文件\n", file_mgr_get_count(&s_file_mgr));
+    LOG_I("MAIN", "已有 %d 个录像文件", file_mgr_get_count(&s_file_mgr));
+#endif
 
-    /* 创建分段录像流水线 */
+#if GST_ON /* GStreamer */
     gst_encoder_config_t enc_config;
     memset(&enc_config, 0, sizeof(enc_config));
     enc_config.device      = CAMERA_DEV;
@@ -122,55 +151,62 @@ static int system_init(void)
     enc_config.fps         = CAMERA_FPS;
     enc_config.bitrate     = VIDEO_BITRATE;
     if (0 != gst_encoder_init(&s_encoder, &enc_config)) {
-        fprintf(stderr, "[ERROR] 编码器初始化失败\n");
+        LOG_E("MAIN", "编码器初始化失败");
         goto cleanup;
     }
     s_encoder_ready = true;
-
     /* 开始录像 */
     if (0 != gst_encoder_start(&s_encoder)) {
-        fprintf(stderr, "[ERROR] 编码器启动失败\n");
+        LOG_E("MAIN", "编码器启动失败");
         goto cleanup;
     }
+    /* 注册预览帧回调（tee 分支 appsink → 预览共享缓冲 → AI 线程） */
+    gst_encoder_set_preview_cb(&s_encoder, preview_frame_cb, &s_preview_share);
+#endif
 
-    /* GPS 线程 */
+#if GPS_ON /* GPS 线程 */
     memset(&s_gps_worker, 0, sizeof(s_gps_worker));
     strncpy(s_gps_worker.dev, GPS_DEV, sizeof(s_gps_worker.dev) - 1);
     s_gps_worker.running = &s_is_running;
     if (0 != thread_mgr_add(&s_thread_mgr, "gps",
                             gps_worker_entry, &s_gps_worker)) {
-        fprintf(stderr, "[ERROR] 注册 GPS 线程失败\n");
+        LOG_E("MAIN", "注册 GPS 线程失败");
         goto cleanup;
     }
+#endif
 
+#if AI_ON
     /* AI 检测线程 */
     memset(&s_ai_worker, 0, sizeof(s_ai_worker));
     strncpy(s_ai_worker.model_path, AI_MODEL_PATH,
             sizeof(s_ai_worker.model_path) - 1);
     strncpy(s_ai_worker.labels_path, AI_LABELS_PATH,
             sizeof(s_ai_worker.labels_path) - 1);
-    strncpy(s_ai_worker.camera_dev, AI_CAMERA_DEV,
-            sizeof(s_ai_worker.camera_dev) - 1);
-    s_ai_worker.running     = &s_is_running;
-    s_ai_worker.frame_share = &s_frame_share;
-    s_ai_worker.file_mgr    = &s_file_mgr; /* person 联动紧急锁定 */
+    s_ai_worker.running       = &s_is_running;
+    s_ai_worker.detect_share  = &s_detect_share;
+    s_ai_worker.preview_share = &s_preview_share;
+    s_ai_worker.file_mgr      = &s_file_mgr; /* person 联动紧急锁定 */
     if (0 != thread_mgr_add(&s_thread_mgr, "ai",
                             ai_worker_entry, &s_ai_worker)) {
-        fprintf(stderr, "[ERROR] 注册 AI 线程失败\n");
+        LOG_E("MAIN", "注册 AI 线程失败");
         goto cleanup;
     }
+#endif
 
+#if UI_ON
     /* UI 线程 */
     memset(&s_ui_worker, 0, sizeof(s_ui_worker));
-    s_ui_worker.running     = &s_is_running;
-    s_ui_worker.file_mgr    = &s_file_mgr;
-    s_ui_worker.gps         = &s_gps_worker;
-    s_ui_worker.frame_share = &s_frame_share;
+    s_ui_worker.running       = &s_is_running;
+    s_ui_worker.file_mgr      = &s_file_mgr;
+    s_ui_worker.preview_share = &s_preview_share;
+    s_ui_worker.gps           = &s_gps_worker;
+    s_ui_worker.detect_share  = &s_detect_share;
     if (0 != thread_mgr_add(&s_thread_mgr, "ui",
                             ui_worker_entry, &s_ui_worker)) {
-        fprintf(stderr, "[ERROR] 注册 UI 线程失败\n");
+        LOG_E("MAIN", "注册 UI 线程失败");
         goto cleanup;
     }
+#endif
 
     ret = 0;
     return 0;
@@ -187,7 +223,6 @@ cleanup:
     return ret;
 }
 
-
 /*****************************************************************************
  * 函数名称：system_deinit
  * 功能描述：停止录像，等待线程收尾，释放资源
@@ -200,9 +235,8 @@ static void system_deinit(void)
     gst_encoder_stop(&s_encoder);
     gst_encoder_deinit(&s_encoder);
     file_mgr_deinit(&s_file_mgr);
-    printf("[INFO] 系统资源已释放\n");
+    LOG_I("MAIN", "系统资源已释放");
 }
-
 
 /*****************************************************************************
  * 函数名称：main
@@ -217,6 +251,12 @@ int main(int argc, char* argv[])
     (void)argc;
     (void)argv;
 
+    /* 关闭 RGA 库的调试日志输出（必须在库加载前设置）。
+     * 注：lv_drivers 内部调用 legacy RGA API 的"弃用警告"是
+     * 库内硬编码打印，该环境变量无法静默（实测 1/0 均打印），
+     * 属预编译依赖库的固有噪音，功能无影响 */
+    setenv("ROCKCHIP_RGA_LOG", "0", 1);
+
     printf("========================================\n");
     printf("  RV1126B 行车记录仪系统 v0.4.0\n");
     printf("========================================\n\n");
@@ -226,38 +266,41 @@ int main(int argc, char* argv[])
     }
 
     if (0 != system_init()) {
-        fprintf(stderr, "[ERROR] 系统初始化失败\n");
+        LOG_E("MAIN", "系统初始化失败");
         goto error;
     }
 
     /* 启动全部业务线程（GPS/AI/UI） */
     if (0 != thread_mgr_start_all(&s_thread_mgr)) {
-        fprintf(stderr, "[ERROR] 线程启动失败\n");
+        LOG_E("MAIN", "线程启动失败");
         /* 先置退出标志让已启动线程自行退出，否则 join 永久阻塞 */
         s_is_running = false;
         system_deinit();
         goto error;
     }
 
-    printf("[INFO] 循环录像中 → %s/rec_XXXXX.mp4（Ctrl+C 停止）\n",
-           RECORD_DIR);
+#if GST_ON
+    LOG_I("MAIN", "循环录像中 → %s/rec_XXXXX.mp4", RECORD_DIR);
+#endif
 
     /* 主循环：编码在 GStreamer 内部线程跑，GPS 在业务线程跑，
      * 主线程每秒巡检一次文件系统（新文件入队 + 超限删除） */
     while (s_is_running) {
         sleep(1);
+#if FILE_ON
         if (0 != file_mgr_check(&s_file_mgr)) {
-            fprintf(stderr, "[WARN] 文件巡检失败（SD 卡异常？）\n");
+            LOG_W("MAIN", "文件巡检失败（SD 卡异常？）");
         }
+#endif
     }
 
-    printf("[INFO] 收到退出信号，停止录像...\n");
+    LOG_I("MAIN", "收到退出信号，停止录像...");
 
     system_deinit();
 
     ret = EXIT_SUCCESS;
 
 error:
-    printf("[INFO] 系统已关闭\n");
+    LOG_I("MAIN", "系统已关闭");
     return ret;
 }

@@ -8,9 +8,11 @@
  *****************************************************************************/
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#include "thumb_pipeline.h"
 #include "ui_pages.h"
 
 /* 主题颜色（简约风格：深灰黑 + 白灰文字，彩色仅 REC 红） */
@@ -135,40 +137,128 @@ static lv_obj_t* ui_page_title_bar(lv_obj_t* parent, const char* title)
 }
 
 /*****************************************************************************
+ * 函数名称：bmp_load_to_canvas
+ * 功能描述：把 24 位 BMP 解码到 canvas 缓冲（BGR24 → BGRA 展开）
+ * 输入参数：@buf      - canvas 缓冲（THUMB_PIPELINE_W*H 个 lv_color_t）
+ *           @bmp_path - BMP 文件路径
+ * 返回值：  成功返回 true，失败 false
+ * 注意事项：我们生成的 BMP 为负 height（像素自上而下），逐行读即可
+ *****************************************************************************/
+static bool bmp_load_to_canvas(lv_color_t* buf, const char* bmp_path)
+{
+    FILE* fp = NULL;
+    uint8_t header[54];
+    uint8_t* row_buf = NULL;
+    int32_t width;
+    int32_t height;
+    uint32_t stride;
+    int y;
+    bool ret = false;
+
+    fp = fopen(bmp_path, "rb");
+    if (NULL == fp) {
+        return false;
+    }
+
+    /* 读 54 字节头并解析宽高（小端） */
+    if (54 != fread(header, 1, 54, fp)) {
+        goto done;
+    }
+    width  = (int32_t)(header[18] | (header[19] << 8) |
+                       (header[20] << 16) | (header[21] << 24));
+    height = (int32_t)(header[22] | (header[23] << 8) |
+                       (header[24] << 16) | (header[25] << 24));
+    if (0 > height) {
+        height = -height; /* 自顶向下存储 */
+    }
+    if ((THUMB_PIPELINE_W != width) || (THUMB_PIPELINE_H != height)) {
+        goto done;
+    }
+
+    /* 每行像素：BMP 行 4 字节对齐的 BGR24 */
+    stride = ((uint32_t)width * 3 + 3) & ~3U;
+    row_buf = (uint8_t*)malloc(stride);
+    if (NULL == row_buf) {
+        goto done;
+    }
+
+    /* 逐行展开 BGR → BGRA */
+    for (y = 0; y < height; y++) {
+        lv_color_t* dst = buf + y * width;
+        int x;
+
+        if (stride != fread(row_buf, 1, stride, fp)) {
+            goto done;
+        }
+        for (x = 0; x < width; x++) {
+            dst[x].ch.blue  = row_buf[x * 3 + 0];
+            dst[x].ch.green = row_buf[x * 3 + 1];
+            dst[x].ch.red   = row_buf[x * 3 + 2];
+            dst[x].ch.alpha = 0xFF;
+        }
+    }
+    ret = true;
+
+done:
+    free(row_buf);
+    fclose(fp);
+    return ret;
+}
+
+/*****************************************************************************
  * 函数名称：ui_library_add_row
- * 功能描述：向列表容器添加一行录像文件卡片
+ * 功能描述：向列表容器添加一行录像文件卡片（缩略图 + 文件名 + 元信息）
  * 输入参数：@parent - 列表容器
  *           @entry  - 文件元数据
+ * 注意事项：行对象 user_data 存 video_path 副本（完成队列匹配用），
+ *           由 ui_library_rebuild 清理时释放
  *****************************************************************************/
 static void ui_library_add_row(lv_obj_t* parent, const video_entry_t* entry)
 {
     lv_obj_t* row = lv_obj_create(parent);
+    lv_obj_t* thumb;
     lv_obj_t* label;
+    lv_color_t* thumb_buf;
+    char* path_copy;
     char name_buf[64];
     char info_buf[96];
     struct tm* tm_info;
 
-    /* 行卡片（共享样式） */
-    lv_obj_set_size(row, lv_pct(100), 96);
+    /* 行卡片（共享样式），高度加大容纳缩略图 */
+    lv_obj_set_size(row, lv_pct(100), 120);
     lv_obj_add_style(row, &s_style_card, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 文件名（白字，左上） */
+    /* 缩略图 canvas（160×90 左侧，生成前显示占位灰） */
+    thumb = lv_canvas_create(row);
+    thumb_buf = (lv_color_t*)malloc(sizeof(lv_color_t) *
+                                    THUMB_PIPELINE_W * THUMB_PIPELINE_H);
+    if (NULL != thumb_buf) {
+        memset(thumb_buf, 0x20, sizeof(lv_color_t) *
+               THUMB_PIPELINE_W * THUMB_PIPELINE_H);
+        lv_canvas_set_buffer(thumb, thumb_buf, THUMB_PIPELINE_W,
+                             THUMB_PIPELINE_H, LV_IMG_CF_TRUE_COLOR);
+    }
+    lv_obj_align(thumb, LV_ALIGN_LEFT_MID, 16, 0);
+    lv_obj_set_style_radius(thumb, 8, 0);
+    lv_obj_set_style_clip_corner(thumb, true, 0);
+
+    /* 文件名（白字，缩略图右侧） */
     strncpy(name_buf, entry->filepath, sizeof(name_buf) - 1);
     name_buf[sizeof(name_buf) - 1] = '\0';
     label = lv_label_create(row);
-    lv_obj_align(label, LV_ALIGN_LEFT_MID, 20, -12);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 200, -16);
     lv_obj_add_style(label, &s_style_text_w, 0);
     lv_label_set_text(label, name_buf);
 
-    /* 时间 + 大小（灰字，左下） */
+    /* 时间 + 大小（灰字） */
     tm_info = localtime(&entry->timestamp);
     strftime(info_buf, 32, "%m-%d %H:%M", tm_info);
     snprintf(info_buf + strlen(info_buf), sizeof(info_buf) - strlen(info_buf),
              "  %llu MB",
              (unsigned long long)(entry->size / 1024 / 1024));
     label = lv_label_create(row);
-    lv_obj_align(label, LV_ALIGN_LEFT_MID, 20, 16);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 200, 16);
     lv_obj_add_style(label, &s_style_text_g, 0);
     lv_label_set_text(label, info_buf);
 
@@ -181,6 +271,55 @@ static void ui_library_add_row(lv_obj_t* parent, const video_entry_t* entry)
     } else {
         lv_obj_add_style(label, &s_style_text_g, 0);
         lv_label_set_text(label, "普通");
+    }
+
+    /* 行对象记忆录像路径（完成队列匹配缩略图用） */
+    path_copy = (char*)malloc(strlen(entry->filepath) + 1);
+    if (NULL != path_copy) {
+        strcpy(path_copy, entry->filepath);
+    }
+    lv_obj_set_user_data(row, path_copy);
+}
+
+/*****************************************************************************
+ * 函数名称：thumb_consume_tick
+ * 功能描述：500ms 消费缩略图完成队列，解码 BMP 上屏
+ * 输入参数：@timer - LVGL 定时器
+ * 注意事项：canvas 缓冲由 lv_obj 持有，rebuild 时随对象销毁释放
+ *****************************************************************************/
+static void thumb_consume_tick(lv_timer_t* timer)
+{
+    thumb_done_t done;
+    lv_obj_t* row;
+
+    (void)timer;
+
+    while (thumb_pipeline_pop_done(&done)) {
+        uint32_t i;
+        uint32_t child_cnt = lv_obj_get_child_cnt(s_lib_list);
+
+        /* 按 video_path 匹配行卡片 */
+        row = NULL;
+        for (i = 0; i < child_cnt; i++) {
+            lv_obj_t* child = lv_obj_get_child(s_lib_list, i);
+            const char* row_path = (const char*)lv_obj_get_user_data(child);
+            if ((NULL != row_path) && (0 == strcmp(row_path, done.video_path))) {
+                row = child;
+                break;
+            }
+        }
+        /* 行仍在列表时解码 BMP 上屏（重建过的列表无此行则跳过） */
+        if (NULL != row) {
+            if (done.ok) {
+                lv_obj_t* thumb = lv_obj_get_child(row, 0);
+                lv_img_dsc_t* img = lv_canvas_get_img(thumb);
+                if ((NULL != img) &&
+                    bmp_load_to_canvas((lv_color_t*)img->data,
+                                       done.bmp_path)) {
+                    lv_obj_invalidate(thumb);
+                }
+            }
+        }
     }
 }
 
@@ -211,9 +350,31 @@ static void ui_library_rebuild(void)
     }
     s_lib_last_count = count;
 
+    /* 释放旧行的动态内存（仅行卡片：以路径副本 user_data 识别，
+     * 占位 label 无 user_data 直接跳过——lv_canvas_get_img 对
+     * 非 canvas 对象会触发 LVGL 断言） */
+    for (i = 0; i < (int)lv_obj_get_child_cnt(s_lib_list); i++) {
+        lv_obj_t* child = lv_obj_get_child(s_lib_list, i);
+        char* path = (char*)lv_obj_get_user_data(child);
+
+        if (NULL != path) {
+            lv_obj_t* thumb = lv_obj_get_child(child, 0);
+            if ((NULL != thumb) &&
+                lv_obj_has_class(thumb, &lv_canvas_class)) {
+                lv_img_dsc_t* img = lv_canvas_get_img(thumb);
+                if (NULL != img) {
+                    free((void*)img->data);
+                }
+            }
+            free(path);
+        }
+    }
     lv_obj_clean(s_lib_list);
+
+    /* 重建列表 + 逐行请求缩略图 */
     for (i = 0; i < count; i++) {
         ui_library_add_row(s_lib_list, &entries[i]);
+        thumb_pipeline_request(entries[i].filepath);
     }
 
     snprintf(title_buf, sizeof(title_buf), "录像文件库 (%d)", count);
@@ -273,10 +434,11 @@ lv_obj_t* ui_page_library_create(ui_worker_t* ui)
     lv_obj_add_style(label, &s_style_text_g, 0);
     lv_label_set_text(label, "加载中...");
 
-    /* 立即重建一次 + 每秒检测变化 */
+    /* 立即重建一次 + 每秒检测变化 + 500ms 消费缩略图完成队列 */
     s_lib_last_count = -1;
     ui_library_rebuild();
     lv_timer_create(ui_library_refresh_tick, 1000, NULL);
+    lv_timer_create(thumb_consume_tick, 500, NULL);
 
     /* 右侧导航栏（全局组件） */
     ui_nav_bar_create(page, ui);

@@ -20,7 +20,7 @@ if(NOT DEFINED ENV{PKG_CONFIG_SYSROOT_DIR})
     set(ENV{PKG_CONFIG_SYSROOT_DIR} "${TOOLCHAIN_DIR}/aarch64-buildroot-linux-gnu/sysroot")
 endif()
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(GST REQUIRED gstreamer-1.0)
+pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0)
 # FFmpeg（离线文件操作：缩略图/回放/导出/修复）
 pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
 

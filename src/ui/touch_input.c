@@ -8,12 +8,15 @@
  * 创建日期：2026-08-14
  *****************************************************************************/
 
+#include <errno.h>
 #include <fcntl.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <linux/input.h>
 
+#include "log.h"
 #include "touch_input.h"
 
 /* 触摸设备节点（Goodix 电容屏，/proc/bus/input/devices 确认） */
@@ -84,7 +87,7 @@ int touch_input_init(void)
 
     s_touch_fd = open(TOUCH_DEV, O_RDONLY | O_NONBLOCK);
     if (0 > s_touch_fd) {
-        perror("[UI] 打开触摸设备失败");
+        LOG_E("UI", "打开触摸设备失败: %s", strerror(errno));
         return -1;
     }
 
@@ -93,7 +96,7 @@ int touch_input_init(void)
     indev_drv.read_cb = touch_read_cb;
     lv_indev_drv_register(&indev_drv);
 
-    printf("[INFO] 触摸输入已注册: %s\n", TOUCH_DEV);
+    LOG_I("UI", "触摸输入已注册: %s", TOUCH_DEV);
     return 0;
 }
 

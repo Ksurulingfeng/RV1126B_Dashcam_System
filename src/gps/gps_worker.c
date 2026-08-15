@@ -16,6 +16,7 @@
 #include <termios.h>
 #include <errno.h>
 
+#include "log.h"
 #include "gps_worker.h"
 
 #define GPS_BAUDRATE  B9600
@@ -36,7 +37,7 @@ static int uart_open(const char *dev)
      * 不用 O_NONBLOCK（它会覆盖 VMIN/VTIME，导致 read 立即返回 EAGAIN） */
     fd = open(dev, O_RDWR | O_NOCTTY);
     if (0 > fd) {
-        fprintf(stderr, "[GPS] 打开 %s 失败: %s\n", dev, strerror(errno));
+        LOG_E("GPS", "打开 %s 失败: %s\n", dev, strerror(errno));
         return -1;
     }
 
@@ -50,7 +51,7 @@ static int uart_open(const char *dev)
 
     tcflush(fd, TCIFLUSH);
     if (0 != tcsetattr(fd, TCSANOW, &tio)) {
-        fprintf(stderr, "[GPS] 配置串口失败: %s\n", strerror(errno));
+        LOG_E("GPS", "配置串口失败: %s\n", strerror(errno));
         close(fd);
         return -1;
     }
@@ -83,12 +84,12 @@ void *gps_worker_entry(void *arg)
 
     worker->fd = uart_open(worker->dev);
     if (0 > worker->fd) {
-        fprintf(stderr, "[GPS] 串口打开失败，线程退出\n");
+        LOG_E("GPS", "串口打开失败，线程退出\n");
         return NULL;
     }
 
     nmea_init(&worker->data);
-    printf("[INFO] GPS 线程启动\n");
+    LOG_I("GPS", "线程启动");
 
     while (*(worker->running)) {
         n = read(worker->fd, buf, sizeof(buf) - 1);
@@ -96,7 +97,7 @@ void *gps_worker_entry(void *arg)
             /* 真错误（如 EC20 拔出）：退避等待，避免忙等空转 */
             error_count++;
             if (1 == error_count % 100) {
-                fprintf(stderr, "[GPS] 串口读取错误（连续 %d 次）\n",
+                LOG_E("GPS", "串口读取错误（连续 %d 次）\n",
                         error_count);
             }
             usleep(100000);
@@ -126,7 +127,7 @@ void *gps_worker_entry(void *arg)
                         gps_worker_get_data(worker, &snapshot);
                         if ((snapshot.is_valid != last_valid) ||
                             (snapshot.satellites != last_sats)) {
-                            printf("[GPS] 定位: %.6f, %.6f 卫星%d 质量%d %s\n",
+                            LOG_I("GPS", "定位: %.6f, %.6f 卫星%d 质量%d %s\n",
                                    snapshot.latitude, snapshot.longitude,
                                    snapshot.satellites, snapshot.fix_quality,
                                    snapshot.is_valid ? "有效" : "未定位");
@@ -144,7 +145,7 @@ void *gps_worker_entry(void *arg)
 
     close(worker->fd);
     worker->fd = -1;
-    printf("[INFO] GPS 线程退出\n");
+    LOG_I("GPS", "线程退出");
     return NULL;
 }
 

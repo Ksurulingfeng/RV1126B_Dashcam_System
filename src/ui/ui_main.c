@@ -17,6 +17,8 @@
 #include "lvgl/lvgl.h"
 #include "display/drm.h"
 
+#include "log.h"
+#include "thumb_pipeline.h"
 #include "touch_input.h"
 #include "ui_main.h"
 #include "ui_pages.h"
@@ -42,8 +44,14 @@ static lv_obj_t* s_label_time;
 static lv_obj_t* s_label_gps;
 static lv_obj_t* s_canvas;
 
-/* canvas 帧缓冲（720×405 BGRA） */
+/* canvas 帧缓冲（1280×720 BGRA，全屏预览） */
 static lv_color_t* s_canvas_buf;
+
+/* 预览原始帧缓冲（NV12，UI 线程专用；BGRA 直接写入 canvas 缓冲） */
+static uint8_t s_nv12_buf[PREVIEW_SIZE];
+
+/* UI 已读预览帧序号（多消费者模式，与 AI 线程各自独立） */
+static uint32_t s_ui_frame_id = 0;
 
 /* freetype 字体实例 */
 static lv_ft_info_t s_ft_info;
@@ -94,20 +102,117 @@ static void ui_status_tick(lv_timer_t* timer)
 }
 
 /*****************************************************************************
+ * 函数名称：nv12_to_bgra
+ * 功能描述：NV12 转 BGRA（标准 YUV→RGB 公式，整型运算）
+ * 输入参数：@nv12   - NV12 数据（Y 平面 + UV 交错平面）
+ * 输出参数：@bgra   - 输出 BGRA（调用者分配 width*height*4）
+ *           @width/@height - 帧尺寸
+ * 注意事项：色度按 2×2 块采样（NV12 420 格式），像素间共享 UV
+ *****************************************************************************/
+static void nv12_to_bgra(const uint8_t* nv12, uint8_t* bgra,
+                         int width, int height)
+{
+    const uint8_t* y_plane = nv12;
+    const uint8_t* uv_plane = nv12 + width * height;
+    int y;
+    int x;
+
+    for (y = 0; y < height; y++) {
+        for (x = 0; x < width; x++) {
+            int y_val = y_plane[y * width + x] - 16;
+            int u_val = uv_plane[(y / 2) * width + (x & ~1)] - 128;
+            int v_val = uv_plane[(y / 2) * width + (x & ~1) + 1] - 128;
+            int r;
+            int g;
+            int b;
+            uint8_t* dst = bgra + (y * width + x) * 4;
+
+            if (0 > y_val) {
+                y_val = 0;
+            }
+            r = (298 * y_val + 409 * v_val + 128) >> 8;
+            g = (298 * y_val - 100 * u_val - 208 * v_val + 128) >> 8;
+            b = (298 * y_val + 516 * u_val + 128) >> 8;
+            if (0 > r) {
+                r = 0;
+            }
+            if (255 < r) {
+                r = 255;
+            }
+            if (0 > g) {
+                g = 0;
+            }
+            if (255 < g) {
+                g = 255;
+            }
+            if (0 > b) {
+                b = 0;
+            }
+            if (255 < b) {
+                b = 255;
+            }
+
+            dst[0] = (uint8_t)b;
+            dst[1] = (uint8_t)g;
+            dst[2] = (uint8_t)r;
+            dst[3] = 0xFF;
+        }
+    }
+}
+
+/*****************************************************************************
+ * 函数名称：ui_draw_detect_boxes
+ * 功能描述：在 canvas 上绘制检测框（绿色描边矩形）
+ * 输入参数：@boxes - 检测框数组
+ *           @count - 框数量
+ *****************************************************************************/
+static void ui_draw_detect_boxes(const detect_box_t* boxes, uint32_t count)
+{
+    lv_draw_rect_dsc_t dsc;
+    uint32_t i;
+
+    lv_draw_rect_dsc_init(&dsc);
+    dsc.bg_opa = LV_OPA_TRANSP;
+    dsc.border_color = lv_color_make(0x00, 0xFF, 0x00);
+    dsc.border_width = 2;
+
+    for (i = 0; i < count; i++) {
+        lv_canvas_draw_rect(s_canvas,
+                            boxes[i].left, boxes[i].top,
+                            boxes[i].right - boxes[i].left,
+                            boxes[i].bottom - boxes[i].top,
+                            &dsc);
+    }
+}
+
+/*****************************************************************************
  * 函数名称：ui_frame_tick
- * 功能描述：33ms 检查一次共享帧缓冲，有新帧刷新 canvas
+ * 功能描述：33ms 检查预览共享帧，新帧转 BGRA 上屏并叠加检测框
  * 输入参数：@timer - LVGL 定时器
+ * 注意事项：预览独立于 AI——AI 关闭时预览照常显示
  *****************************************************************************/
 static void ui_frame_tick(lv_timer_t* timer)
 {
     ui_worker_t* ui = (ui_worker_t*)timer->user_data;
+    detect_box_t boxes[DETECT_BOX_MAX];
+    uint32_t box_count = 0;
 
-    if ((NULL == ui) || (NULL == ui->frame_share) || (NULL == s_canvas_buf)) {
+    if ((NULL == ui) || (NULL == ui->preview_share) || (NULL == s_canvas_buf)) {
         return;
     }
 
-    /* 有新帧 → 拷入 canvas 缓冲并请求重绘 */
-    if (frame_share_pop(ui->frame_share, (uint8_t*)s_canvas_buf)) {
+    /* 有新帧 → NV12→BGRA 直写 canvas（lv_color_t 32 位即 BGRA 字节序；
+     * 先拷帧再画框，避免旧框残影） */
+    if (preview_share_pop(ui->preview_share, s_nv12_buf, &s_ui_frame_id)) {
+        nv12_to_bgra(s_nv12_buf, (uint8_t*)s_canvas_buf,
+                     PREVIEW_WIDTH, PREVIEW_HEIGHT);
+
+        /* AI 在线时叠加最新检测框 */
+        if ((NULL != ui->detect_share) &&
+            detect_share_pop(ui->detect_share, boxes, &box_count)) {
+            ui_draw_detect_boxes(boxes, box_count);
+        }
+
         lv_obj_invalidate(s_canvas);
     }
 }
@@ -376,14 +481,16 @@ static void ui_build_live_page(ui_worker_t* ui)
 
     /* 全屏预览 canvas（1280×720 铺满屏幕，底层，先创建保证 z 序最底） */
     s_canvas     = lv_canvas_create(screen);
-    s_canvas_buf = (lv_color_t*)malloc(FRAME_SHARE_SIZE);
+    s_canvas_buf = (lv_color_t*)malloc(sizeof(lv_color_t) *
+                                       PREVIEW_WIDTH * PREVIEW_HEIGHT);
     if (NULL == s_canvas_buf) {
-        fprintf(stderr, "[UI] canvas 缓冲分配失败\n");
+        LOG_E("UI", "canvas 缓冲分配失败");
         return;
     }
-    memset(s_canvas_buf, 0, FRAME_SHARE_SIZE);
+    memset(s_canvas_buf, 0,
+           sizeof(lv_color_t) * PREVIEW_WIDTH * PREVIEW_HEIGHT);
     lv_canvas_set_buffer(s_canvas, s_canvas_buf,
-                         FRAME_SHARE_WIDTH, FRAME_SHARE_HEIGHT,
+                         PREVIEW_WIDTH, PREVIEW_HEIGHT,
                          LV_IMG_CF_TRUE_COLOR);
     lv_obj_align(s_canvas, LV_ALIGN_CENTER, 0, 0);
 
@@ -416,11 +523,11 @@ void* ui_worker_entry(void* arg)
     /* LVGL 初始化 + DRM 显示驱动（正点原子适配，自动探测分辨率） */
     lv_init();
     drm_disp_drv_init(0, 0, 90); /* 旋转90° */
-    printf("[INFO] UI 线程启动（DRM 后端）\n");
+    LOG_I("UI", "线程启动（DRM 后端）");
 
     /* 触摸输入注册（Goodix 电容屏，失败不影响显示） */
     if (0 != touch_input_init()) {
-        fprintf(stderr, "[UI] 触摸输入不可用，界面仅作显示\n");
+        LOG_W("UI", "触摸输入不可用，界面仅作显示");
     }
 
     /* 中文字体初始化（freetype 渲染思源黑体，页面共享） */
@@ -429,9 +536,14 @@ void* ui_worker_entry(void* arg)
     s_ft_info.style  = FT_FONT_STYLE_NORMAL;
     s_ft_info.mem    = NULL;
     if (!lv_ft_font_init(&s_ft_info)) {
-        fprintf(stderr, "[UI] 中文字体初始化失败，汉字将无法显示\n");
+        LOG_W("UI", "中文字体初始化失败，汉字将无法显示");
     }
     ui->font = s_ft_info.font;
+
+    /* 缩略图后台生成管线（低优先级线程，失败不影响 UI） */
+    if (0 != thumb_pipeline_init()) {
+        LOG_W("UI", "缩略图管线初始化失败");
+    }
 
     /* 构建主页 */
     ui_build_live_page(ui);
@@ -446,6 +558,9 @@ void* ui_worker_entry(void* arg)
         usleep(wait_ms * 1000);
     }
 
+    /* 停止缩略图生成线程 */
+    thumb_pipeline_stop();
+
     /* 释放 canvas 缓冲 */
     if (NULL != s_canvas_buf) {
         free(s_canvas_buf);
@@ -453,6 +568,6 @@ void* ui_worker_entry(void* arg)
     }
 
     drm_disp_drv_deinit();
-    printf("[INFO] UI 线程退出\n");
+    LOG_I("UI", "线程退出");
     return NULL;
 }

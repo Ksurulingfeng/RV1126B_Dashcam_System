@@ -13,7 +13,15 @@
 
 #include <gst/gst.h>
 
+#include "log.h"
+#include <gst/app/gstappsink.h>
+
 #include "gst_encoder.h"
+
+/* 预览分支输出尺寸（tee 分流后缩放，供 AI 推理与 UI 显示，
+ * 与 preview_share.h 的 PREVIEW_WIDTH/HEIGHT 保持一致） */
+#define PREVIEW_BRANCH_W 1280
+#define PREVIEW_BRANCH_H 720
 
 /* splitmuxsink 文件命名模板缓冲大小 */
 #define LOCATION_BUF_SIZE 512
@@ -82,9 +90,46 @@ static void setup_sink_props(GstElement *sink,
 
 
 /*****************************************************************************
+ * 函数名称：appsink_new_sample
+ * 功能描述：appsink 新帧回调——取出 NV12 数据转交预览回调
+ * 输入参数：@appsink   - 触发回调的 appsink
+ *           @user_data - gst_encoder_t 上下文
+ * 返回值：  GST_FLOW_OK / GST_FLOW_ERROR
+ * 注意事项：在 GStreamer 内部线程执行，只做快速转发（回调内仅拷贝）
+ *****************************************************************************/
+static GstFlowReturn appsink_new_sample(GstAppSink *appsink,
+                                        gpointer user_data)
+{
+    gst_encoder_t *enc = (gst_encoder_t *)user_data;
+    GstSample *sample = NULL;
+    GstBuffer *buffer = NULL;
+    GstMapInfo map;
+
+    sample = gst_app_sink_pull_sample(appsink);
+    if (NULL == sample) {
+        return GST_FLOW_ERROR;
+    }
+
+    buffer = gst_sample_get_buffer(sample);
+    if ((NULL != buffer) && gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        if (NULL != enc->preview_cb) {
+            enc->preview_cb(map.data, enc->preview_user_data);
+        }
+        gst_buffer_unmap(buffer, &map);
+    }
+
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
+
+/*****************************************************************************
  * 函数名称：create_record_pipeline
- * 功能描述：创建并组装分段录像流水线
- *           v4l2src → capsfilter → mpph264enc → h264parse → splitmuxsink
+ * 功能描述：创建并组装分段录像流水线（tee 双分支：录像 + 预览）
+ *           v4l2src → capsfilter → tee ─┬→ queue → mpph264enc → h264parse
+ *                                      │     → splitmuxsink（录像）
+ *                                      └→ queue → videoscale → appsink
+ *                                            （预览，AI 推理同源）
  * 输入参数：@enc    - 编码器上下文（保存 pipeline/bus）
  *           @config - 编码配置
  * 返回值：  成功返回0，失败返回-1
@@ -97,10 +142,17 @@ static int create_record_pipeline(gst_encoder_t *enc,
     GstElement *pipeline = NULL;
     GstElement *src = NULL;
     GstElement *capsfilter = NULL;
+    GstElement *tee = NULL;
+    GstElement *queue_rec = NULL;
+    GstElement *queue_prev = NULL;
+    GstElement *scale = NULL;
+    GstElement *appsink = NULL;
     GstElement *encoder = NULL;
     GstElement *parser = NULL;
     GstElement *sink = NULL;
     GstCaps    *caps = NULL;
+    GstCaps    *prev_caps = NULL;
+    GstAppSinkCallbacks cb;
 
     /* 创建流水线容器 */
     pipeline = gst_pipeline_new("record-pipeline");
@@ -109,16 +161,24 @@ static int create_record_pipeline(gst_encoder_t *enc,
     }
 
     /* 创建各元件：
-     * v4l2src 采集 / capsfilter 格式过滤 / mpph264enc RK 硬件编码 /
-     * h264parse 码流整理 / splitmuxsink 分段封装 */
+     * v4l2src 采集 / capsfilter 格式过滤 / tee 分流 /
+     * queue 缓冲隔离 / videoscale 预览缩放 / appsink 预览出口 /
+     * mpph264enc RK 硬件编码 / h264parse 码流整理 / splitmuxsink 分段封装 */
     src        = gst_element_factory_make("v4l2src",      "src");
     capsfilter = gst_element_factory_make("capsfilter",   "filter");
+    tee        = gst_element_factory_make("tee",          "tee");
+    queue_rec  = gst_element_factory_make("queue",        "queue_rec");
+    queue_prev = gst_element_factory_make("queue",        "queue_prev");
+    scale      = gst_element_factory_make("videoscale",   "preview_scale");
+    appsink    = gst_element_factory_make("appsink",      "preview_sink");
     encoder    = gst_element_factory_make("mpph264enc",   "encoder");
     parser     = gst_element_factory_make("h264parse",    "parser");
     sink       = gst_element_factory_make("splitmuxsink", "sink");
-    if ((NULL == src) || (NULL == capsfilter) || (NULL == encoder) ||
-        (NULL == parser) || (NULL == sink)) {
-        fprintf(stderr, "创建 GStreamer 元件失败\n");
+    if ((NULL == src) || (NULL == capsfilter) || (NULL == tee) ||
+        (NULL == queue_rec) || (NULL == queue_prev) || (NULL == scale) ||
+        (NULL == appsink) || (NULL == encoder) || (NULL == parser) ||
+        (NULL == sink)) {
+        LOG_E("GST", "创建 GStreamer 元件失败");
         goto error;
     }
 
@@ -145,14 +205,40 @@ static int create_record_pipeline(gst_encoder_t *enc,
     gst_caps_unref(caps);
     caps = NULL;
 
-    /* 组装：先 add（bin 接管元件所有权），后 link */
-    gst_bin_add_many(GST_BIN(pipeline), src, capsfilter, encoder,
-                     parser, sink, NULL);
+    /* 预览分支：appsink 输出 caps（NV12 720p）+ 非同步 + 丢帧策略 */
+    prev_caps = gst_caps_new_simple(
+        "video/x-raw",
+        "format",    G_TYPE_STRING, "NV12",
+        "width",     G_TYPE_INT,    PREVIEW_BRANCH_W,
+        "height",    G_TYPE_INT,    PREVIEW_BRANCH_H,
+        "framerate", GST_TYPE_FRACTION, (int)config->fps, 1,
+        NULL);
+    if (NULL == prev_caps) {
+        goto error;
+    }
+    g_object_set(G_OBJECT(appsink), "caps", prev_caps, NULL);
+    gst_caps_unref(prev_caps);
+    prev_caps = NULL;
+    g_object_set(G_OBJECT(appsink), "sync", FALSE, NULL);
+    g_object_set(G_OBJECT(appsink), "max-buffers", 2, NULL);
+    g_object_set(G_OBJECT(appsink), "drop", TRUE, NULL);
+
+    /* appsink 新帧回调（转交预览回调，AI 线程消费） */
+    memset(&cb, 0, sizeof(cb));
+    cb.new_sample = appsink_new_sample;
+    gst_app_sink_set_callbacks(GST_APP_SINK(appsink), &cb, enc, NULL);
+
+    /* 组装：先 add（bin 接管元件所有权），后 link tee 双分支 */
+    gst_bin_add_many(GST_BIN(pipeline), src, capsfilter, tee,
+                     queue_rec, queue_prev, scale, appsink,
+                     encoder, parser, sink, NULL);
     if ((FALSE == gst_element_link(src, capsfilter)) ||
-        (FALSE == gst_element_link(capsfilter, encoder)) ||
-        (FALSE == gst_element_link(encoder, parser)) ||
-        (FALSE == gst_element_link(parser, sink))) {
-        fprintf(stderr, "GStreamer 元件连接失败\n");
+        (FALSE == gst_element_link(capsfilter, tee)) ||
+        (FALSE == gst_element_link_many(tee, queue_rec, encoder,
+                                        parser, sink, NULL)) ||
+        (FALSE == gst_element_link_many(tee, queue_prev, scale,
+                                        appsink, NULL))) {
+        LOG_E("GST", "GStreamer 元件连接失败");
         goto error;
     }
 
@@ -163,11 +249,34 @@ static int create_record_pipeline(gst_encoder_t *enc,
 
 error:
     /* 元件已入 bin 由 pipeline 析构释放，这里只释放 caps 和 pipeline */
+    if (NULL != prev_caps) {
+        gst_caps_unref(prev_caps);
+    }
     if (NULL != caps) {
         gst_caps_unref(caps);
     }
     gst_object_unref(pipeline);
     return -1;
+}
+
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_set_preview_cb
+ * 功能描述：注册预览帧回调（tee 分支 appsink 新帧触发）
+ * 输入参数：@enc       - 编码器上下文
+ *           @cb        - 回调函数（NULL 取消）
+ *           @user_data - 回调上下文
+ * 注意事项：回调在 GStreamer 内部线程执行，必须快速返回
+ *****************************************************************************/
+void gst_encoder_set_preview_cb(gst_encoder_t *enc,
+                                gst_preview_frame_cb cb, void *user_data)
+{
+    if (NULL == enc) {
+        return;
+    }
+
+    enc->preview_cb = cb;
+    enc->preview_user_data = user_data;
 }
 
 
@@ -190,7 +299,7 @@ int gst_encoder_init(gst_encoder_t *enc, const gst_encoder_config_t *config)
     if ((0 == config->segment_sec) || (0 == config->width) ||
         (0 == config->height) || (0 == config->fps) ||
         (0 == config->bitrate)) {
-        fprintf(stderr, "[encoder] 无效编码参数\n");
+        LOG_E("GST", "无效编码参数");
         return -1;
     }
 
@@ -225,7 +334,7 @@ int gst_encoder_start(gst_encoder_t *enc)
     /* NULL → PLAYING，GStreamer 内部自动经过 READY/PAUSED */
     ret = gst_element_set_state(enc->pipeline, GST_STATE_PLAYING);
     if (GST_STATE_CHANGE_FAILURE == ret) {
-        fprintf(stderr, "流水线启动失败\n");
+        LOG_E("GST", "流水线启动失败");
         return -1;
     }
 
@@ -251,7 +360,7 @@ void gst_encoder_stop(gst_encoder_t *enc)
     /* 发 EOS：事件沿数据流向下游传播，splitmuxsink 收到后封口当前文件 */
     if (FALSE == gst_element_send_event(enc->pipeline,
                                         gst_event_new_eos())) {
-        fprintf(stderr, "[encoder] EOS 发送失败（流水线未运行？）\n");
+        LOG_W("GST", "EOS 发送失败（流水线未运行？）");
     }
 
     /* 等 EOS 传递完（最多 EOS_WAIT_SEC 秒） */
@@ -260,7 +369,7 @@ void gst_encoder_stop(gst_encoder_t *enc)
                                          EOS_WAIT_SEC * GST_SECOND,
                                          GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
         if (NULL == msg) {
-            fprintf(stderr, "[encoder] EOS 超时，最后分段可能不完整\n");
+            LOG_W("GST", "EOS 超时，最后分段可能不完整");
         } else {
             gst_message_unref(msg);
         }

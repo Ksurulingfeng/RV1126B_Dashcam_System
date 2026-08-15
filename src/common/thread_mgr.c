@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "log.h"
 #include "thread_mgr.h"
 
 /*****************************************************************************
@@ -31,7 +32,7 @@ int thread_mgr_add(thread_mgr_t *mgr, const char *name,
     }
 
     if (mgr->count >= THREAD_MAX) {
-        fprintf(stderr, "[thread_mgr] 线程表已满(%d)\n", THREAD_MAX);
+        LOG_E("THREAD", "线程表已满(%d)", THREAD_MAX);
         return -1;
     }
 
@@ -62,11 +63,11 @@ int thread_mgr_start_all(thread_mgr_t *mgr)
         thread_info_t *info = &mgr->threads[i];
 
         if (0 != pthread_create(&info->tid, NULL, info->entry, info->arg)) {
-            fprintf(stderr, "[thread_mgr] 创建线程 %s 失败\n", info->name);
+            LOG_E("THREAD", "创建线程 %s 失败", info->name);
             return -1;
         }
         info->is_started = true;
-        printf("[INFO] 线程 %s 已启动\n", info->name);
+        LOG_I("THREAD", "线程 %s 已启动", info->name);
     }
 
     return 0;
@@ -91,7 +92,7 @@ void thread_mgr_join_all(thread_mgr_t *mgr)
 
         if (info->is_started) {
             pthread_join(info->tid, NULL);
-            printf("[INFO] 线程 %s 已退出\n", info->name);
+            LOG_I("THREAD", "线程 %s 已退出", info->name);
             info->is_started = false;
         }
     }

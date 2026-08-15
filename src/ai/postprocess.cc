@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "log.h"
 #include "postprocess.h"
 
 #include <math.h>
@@ -64,7 +65,7 @@ int readLines(const char *fileName, char *lines[], int max_line)
 
   if (file == NULL)
   {
-    printf("Open %s fail!\n", fileName);
+    LOG_E("AI", "打开标签文件失败: %s", fileName);
     return -1;
   }
 
@@ -81,7 +82,7 @@ int readLines(const char *fileName, char *lines[], int max_line)
 
 int loadLabelName(const char *locationFilename, char *label[])
 {
-  printf("loadLabelName %s\n", locationFilename);
+  LOG_D("AI", "加载标签: %s", locationFilename);
   return readLines(locationFilename, label, OBJ_CLASS_NUM);
 }
 

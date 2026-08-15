@@ -13,21 +13,22 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "detect_share.h"
 #include "file_mgr.h"
-#include "frame_share.h"
+#include "preview_share.h"
 
 /* AI 模块路径缓冲长度 */
-#define AI_PATH_MAX     128 /* 模型/标签文件路径 */
-#define AI_DEV_PATH_MAX 64  /* 摄像头设备节点路径 */
+#define AI_PATH_MAX 128 /* 模型/标签文件路径 */
 
 /* AI 线程上下文 */
 typedef struct {
-    char            model_path[AI_PATH_MAX];      /* .rknn 模型路径 */
-    char            labels_path[AI_PATH_MAX];     /* 类别标签文件路径 */
-    char            camera_dev[AI_DEV_PATH_MAX];  /* 摄像头节点（video24） */
-    volatile bool  *running;            /* 退出标志 */
-    frame_share_t  *frame_share;        /* 帧共享缓冲（推给 UI 显示） */
-    file_mgr_t     *file_mgr;           /* 文件管理器（person 触发紧急锁定用） */
+    char             model_path[AI_PATH_MAX];  /* .rknn 模型路径 */
+    char             labels_path[AI_PATH_MAX]; /* 类别标签文件路径 */
+    volatile bool   *running;            /* 退出标志 */
+    preview_share_t *preview_share;      /* 预览帧源（GStreamer tee 分支，
+                                            与录像同源同视野） */
+    detect_share_t  *detect_share;       /* 检测结果输出（UI 画框用） */
+    file_mgr_t      *file_mgr;           /* 文件管理器（person 触发紧急锁定用） */
 } ai_worker_t;
 
 #ifdef __cplusplus

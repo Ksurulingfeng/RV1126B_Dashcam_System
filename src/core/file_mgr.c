@@ -15,6 +15,8 @@
 #include <time.h>     /* time_t */
 #include <unistd.h>   /* remove */
 
+#include "log.h"
+
 #include "file_mgr.h"
 
 /* 扫描缓冲初始容量（文件数），不足自动翻倍 */
@@ -212,7 +214,7 @@ static int node_lock(file_mgr_t *mgr, video_node_t *node)
 
     /* rename 持久化锁定：重启后扫描文件名仍可恢复状态 */
     if (0 != rename(node->entry.filepath, new_path)) {
-        fprintf(stderr, "[file_mgr] 锁定失败: %s\n", node->entry.filepath);
+        LOG_W("FILE", "锁定失败: %s", node->entry.filepath);
         return -1;
     }
 
@@ -586,7 +588,7 @@ int file_mgr_check(file_mgr_t *mgr)
 
     /* 锁外扫描目录：磁盘 I/O 不阻塞 AI 锁定与 UI 查询 */
     if (0 != scan_dir_entries(mgr->storage_path, &entries, &count)) {
-        fprintf(stderr, "[file_mgr] 扫描目录失败（SD 卡异常？）\n");
+        LOG_E("FILE", "扫描目录失败（SD 卡异常？）");
         return -1;
     }
 
