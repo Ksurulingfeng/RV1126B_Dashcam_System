@@ -7,6 +7,7 @@
 本项目以正点原子 ATK-DLRV1126B 开发板为硬件平台，实现了一台功能完整的智能行车记录仪：
 
 - **1080P 循环录像**：GStreamer 管线硬件编码（MPP），5 分钟无缝分段，SD 卡满自动覆盖最旧录像
+- **断电保护**：robust muxing——moov 索引每秒刷新磁盘，断电/强杀最多丢 1 秒录像，已录内容永远可播
 - **紧急锁定保护**：AI 检测到 person 连续 3 帧自动锁定当前分段（`_E` 后缀持久化），循环覆盖永不删除
 - **AI 目标检测**：YOLOv5s 部署于 3.0 TOPS NPU（RKNN INT8 量化），实测约 40fps，检测框实时绘制
 - **触摸交互 UI**：LVGL 8.4 + DRM 90° 旋转，自写 Goodix 电容触摸驱动，多页面架构（主页/录像库/设置）
@@ -21,7 +22,8 @@
 ├─────────────────────────────────────────────────────────────┤
 │ 业务模块层                                                     │
 │  gst_encoder │ file_mgr │ gps_worker │ ai_worker │ ui_main    │
-│  thumb_gen   │ frame_share │ thread_mgr │ touch_input          │
+│  thumb_gen   │ preview_share │ detect_share │ thread_mgr       │
+│  touch_input │ log（分级日志）                                  │
 ├─────────────────────────────────────────────────────────────┤
 │ 框架层：                                                       │
 │  GStreamer（实时链路：v4l2src/mpph264enc/splitmuxsink）        │
@@ -36,11 +38,17 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 实时录像链路
+### 实时录像链路（同源 tee 分流 + 低延迟预览 + 断电保护）
 
 ```
-IMX415 → v4l2src → capsfilter(NV12/1080P) → mpph264enc(硬件编码)
-       → h264parse → splitmuxsink(5分钟分段+MP4封装) → SD 卡 rec_XXXXX.mp4
+IMX415 → v4l2src → capsfilter(NV12/1080P) → tee ─┬→ queue → mpph264enc(硬编码)
+                                                  │     → h264parse → splitmuxsink
+                                                  │       (5分钟分段 + robust muxing：
+                                                  │        moov 每秒刷新，断电最多丢 1 秒)
+                                                  └→ queue(限1帧丢旧) → videoscale(720p)
+                                                        → tee2 ─┬→ appsink(NV12) → AI 推理
+                                                                └→ videoconvert(BGRA)
+                                                                   → appsink → UI 直拷
                                                         ↓
                                     file_mgr 巡检（超限删最旧、_E 锁定保护）
 ```
@@ -48,10 +56,10 @@ IMX415 → v4l2src → capsfilter(NV12/1080P) → mpph264enc(硬件编码)
 ### AI 链路
 
 ```
-/dev/video24(ISP selfpath) → OpenCV 采集 → letterbox 640×640
-                           → RKNN NPU 推理 → NMS 后处理
-                           → 检测框绘制（滞后一帧）→ frame_share → UI 显示
-                           → person 连续 3 帧 → file_mgr_lock_latest
+GStreamer tee 预览分支(NV12 720p，与录像同源同视野)
+  → preview_share（帧共享）→ RKNN 推理（letterbox 640×640）→ NMS 后处理
+  → detect_share（检测结果）→ UI 检测框叠加
+  → person 连续 3 帧 → file_mgr_lock_latest（紧急锁定 _E）
 ```
 
 ## 硬件平台
@@ -86,7 +94,7 @@ RV1126B_Dashcam_System/
 │   ├── av/           # 音视频（gst_encoder 分段录像 + thumb_gen FFmpeg 缩略图）
 │   ├── core/         # 核心业务（file_mgr 目录守护：锁定/巡检删除）
 │   ├── gps/          # GPS（nmea_parser 解析 + gps_worker 线程）
-│   ├── common/       # 公共组件（thread_mgr 线程注册表 + frame_share 帧共享）
+│   ├── common/       # 公共组件（thread_mgr + preview_share/detect_share 共享 + log 日志）
 │   ├── ui/           # 图形界面（LVGL 多页面 + touch_input 触摸驱动）
 │   ├── ai/           # AI 推理（YOLOv5s RKNN + 检测框 + 紧急联动）
 │   ├── network/      # 网络（RTSP 推流、云端上传规划中）
