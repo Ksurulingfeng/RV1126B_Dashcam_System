@@ -29,8 +29,8 @@
  *           UI 预览依赖 GST（preview_share），AI 仅提供检测框叠加 */
 #define FILE_ON 1
 #define GST_ON  1
-#define GPS_ON  0
-#define AI_ON   0
+#define GPS_ON  1
+#define AI_ON   1
 #define UI_ON   1
 
 /* 依赖校验：AI 帧源来自 GStreamer 预览分支，关 GST 必须关 AI，
@@ -73,6 +73,17 @@ static void preview_frame_cb(const uint8_t* nv12, void* user_data)
     preview_share_push((preview_share_t*)user_data, nv12);
 }
 
+/*****************************************************************************
+ * 函数名称：preview_bgra_frame_cb
+ * 功能描述：GStreamer BGRA 预览帧回调（管线内 videoconvert 转换完成）
+ * 输入参数：@bgra      - BGRA 帧数据（UI 显示格式）
+ *           @user_data - preview_share_t 指针（BGRA 实例）
+ *****************************************************************************/
+static void preview_bgra_frame_cb(const uint8_t* bgra, void* user_data)
+{
+    preview_share_push((preview_share_t*)user_data, bgra);
+}
+
 /* 全局模块实例 */
 static gst_encoder_t s_encoder;
 static file_mgr_t s_file_mgr;
@@ -81,7 +92,8 @@ static ai_worker_t s_ai_worker;
 static ui_worker_t s_ui_worker;
 static thread_mgr_t s_thread_mgr;
 static detect_share_t s_detect_share;   /* AI → UI 检测结果 */
-static preview_share_t s_preview_share; /* GStreamer → AI 预览帧 */
+static preview_share_t s_preview_share;      /* GStreamer → AI（NV12） */
+static preview_share_t s_preview_bgra_share; /* GStreamer → UI（BGRA） */
 
 /* 模块初始化完成标志（错误清理时按序释放） */
 static bool s_encoder_ready  = false;
@@ -129,7 +141,8 @@ static int system_init(void)
 
     /* 跨线程共享数据 */
     detect_share_init(&s_detect_share);   /* 检测结果共享（AI → UI） */
-    preview_share_init(&s_preview_share); /* 预览帧共享（GStreamer → AI/UI） */
+    preview_share_init(&s_preview_share, PREVIEW_NV12_SIZE);
+    preview_share_init(&s_preview_bgra_share, PREVIEW_BGRA_SIZE);
 
 #if FILE_ON /* 文件管理器 */
     if (0 != file_mgr_init(&s_file_mgr, RECORD_DIR, MAX_STORAGE)) {
@@ -162,6 +175,8 @@ static int system_init(void)
     }
     /* 注册预览帧回调（tee 分支 appsink → 预览共享缓冲 → AI 线程） */
     gst_encoder_set_preview_cb(&s_encoder, preview_frame_cb, &s_preview_share);
+    gst_encoder_set_preview_bgra_cb(&s_encoder, preview_bgra_frame_cb,
+                                    &s_preview_bgra_share);
 #endif
 
 #if GPS_ON /* GPS 线程 */
@@ -198,7 +213,7 @@ static int system_init(void)
     memset(&s_ui_worker, 0, sizeof(s_ui_worker));
     s_ui_worker.running       = &s_is_running;
     s_ui_worker.file_mgr      = &s_file_mgr;
-    s_ui_worker.preview_share = &s_preview_share;
+    s_ui_worker.preview_share = &s_preview_bgra_share;
     s_ui_worker.gps           = &s_gps_worker;
     s_ui_worker.detect_share  = &s_detect_share;
     if (0 != thread_mgr_add(&s_thread_mgr, "ui",
@@ -235,6 +250,9 @@ static void system_deinit(void)
     gst_encoder_stop(&s_encoder);
     gst_encoder_deinit(&s_encoder);
     file_mgr_deinit(&s_file_mgr);
+    /* 预览共享缓冲：线程已全部退出，可安全释放 */
+    preview_share_deinit(&s_preview_share);
+    preview_share_deinit(&s_preview_bgra_share);
     LOG_I("MAIN", "系统资源已释放");
 }
 

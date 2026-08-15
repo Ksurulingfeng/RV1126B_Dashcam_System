@@ -23,11 +23,20 @@
 #define PREVIEW_BRANCH_W 1280
 #define PREVIEW_BRANCH_H 720
 
+/* 预览分支低延迟队列：只保留最新 1 帧，满时丢最旧（leaky=downstream） */
+#define PREVIEW_QUEUE_BUFFERS 1
+#define PREVIEW_QUEUE_LEAKY   2 /* GST_QUEUE_LEAK_DOWNSTREAM */
+
 /* splitmuxsink 文件命名模板缓冲大小 */
 #define LOCATION_BUF_SIZE 512
 
-/* EOS 封口等待上限（秒），超时说明流水线卡死 */
-#define EOS_WAIT_SEC 2
+/* 稳健复用参数：moov 索引每 1 秒刷新到磁盘，断电后文件
+ * 保留最近一次索引，已录内容基本可播（robust muxing 官方方案） */
+#define MOOV_UPDATE_PERIOD_NS 1000000000ULL /* 1 秒（单位 ns） */
+
+/* EOS 封口等待上限（秒）：async-finalize 封口在后台线程执行，
+ * SD 卡写入慢时可能超 2 秒，放宽到 5 秒纯防御（正常封口远快于此） */
+#define EOS_WAIT_SEC 5
 
 
 /*****************************************************************************
@@ -69,14 +78,21 @@ static int get_next_file_index(const char *dir)
 
 /*****************************************************************************
  * 函数名称：setup_sink_props
- * 功能描述：配置 splitmuxsink 属性（命名模板/分段时长/序号接续）
+ * 功能描述：配置 splitmuxsink 属性（稳健复用 muxer / 命名模板 /
+ *           分段时长 / 序号接续）
  * 输入参数：@sink   - splitmuxsink 元件
  *           @config - 编码配置
- * 注意事项：序号扫描在重启时接续旧文件，防止覆盖
+ * 返回值：  成功返回0，失败返回-1
+ * 注意事项：稳健复用（robust muxing）让 mp4mux 周期性刷新 moov
+ *           到磁盘，断电后文件保留最近一次索引，已录内容可播；
+ *           采用 async-finalize + muxer-properties 路径：属性经
+ *           GstStructure 传递，切段新建 muxer 会重新应用，
+ *           旧文件在后台线程封口，切段不停顿
  *****************************************************************************/
-static void setup_sink_props(GstElement *sink,
-                             const gst_encoder_config_t *config)
+static int setup_sink_props(GstElement *sink,
+                            const gst_encoder_config_t *config)
 {
+    GstStructure *muxer_props = NULL;
     char location[LOCATION_BUF_SIZE];
     int start_index;
 
@@ -86,12 +102,31 @@ static void setup_sink_props(GstElement *sink,
     g_object_set(G_OBJECT(sink), "max-size-time",
                  (guint64)config->segment_sec * GST_SECOND, NULL);
     g_object_set(G_OBJECT(sink), "start-index", start_index, NULL);
+
+    /* 稳健复用：moov 索引每 1 秒刷新到磁盘，断电后已录内容可播。
+     * reserved-moov-update-period 必须由应用显式设置非零才生效 */
+    muxer_props = gst_structure_new(
+        "properties",
+        "reserved-moov-update-period", G_TYPE_UINT64,
+        (guint64)MOOV_UPDATE_PERIOD_NS,
+        NULL);
+    if (NULL == muxer_props) {
+        return -1;
+    }
+    g_object_set(G_OBJECT(sink),
+                 "use-robust-muxing", TRUE,
+                 "async-finalize", TRUE,
+                 "muxer-properties", muxer_props,
+                 NULL);
+    gst_structure_free(muxer_props);
+
+    return 0;
 }
 
 
 /*****************************************************************************
  * 函数名称：appsink_new_sample
- * 功能描述：appsink 新帧回调——取出 NV12 数据转交预览回调
+ * 功能描述：appsink 新帧回调——取出 NV12 数据转交预览回调（AI 推理）
  * 输入参数：@appsink   - 触发回调的 appsink
  *           @user_data - gst_encoder_t 上下文
  * 返回值：  GST_FLOW_OK / GST_FLOW_ERROR
@@ -124,10 +159,44 @@ static GstFlowReturn appsink_new_sample(GstAppSink *appsink,
 
 
 /*****************************************************************************
+ * 函数名称：appsink_bgra_new_sample
+ * 功能描述：BGRA appsink 新帧回调——转交 BGRA 预览回调（UI 显示）
+ * 输入参数：@appsink   - 触发回调的 appsink
+ *           @user_data - gst_encoder_t 上下文
+ * 返回值：  GST_FLOW_OK / GST_FLOW_ERROR
+ * 注意事项：BGRA 转换已在管线内 videoconvert 完成，UI 零转换开销
+ *****************************************************************************/
+static GstFlowReturn appsink_bgra_new_sample(GstAppSink *appsink,
+                                             gpointer user_data)
+{
+    gst_encoder_t *enc = (gst_encoder_t *)user_data;
+    GstSample *sample = NULL;
+    GstBuffer *buffer = NULL;
+    GstMapInfo map;
+
+    sample = gst_app_sink_pull_sample(appsink);
+    if (NULL == sample) {
+        return GST_FLOW_ERROR;
+    }
+
+    buffer = gst_sample_get_buffer(sample);
+    if ((NULL != buffer) && gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+        if (NULL != enc->preview_bgra_cb) {
+            enc->preview_bgra_cb(map.data, enc->preview_bgra_user_data);
+        }
+        gst_buffer_unmap(buffer, &map);
+    }
+
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
+
+/*****************************************************************************
  * 函数名称：create_record_pipeline
  * 功能描述：创建并组装分段录像流水线（tee 双分支：录像 + 预览）
  *           v4l2src → capsfilter → tee ─┬→ queue → mpph264enc → h264parse
- *                                      │     → splitmuxsink（录像）
+ *                                      │     → splitmuxsink（稳健复用录像）
  *                                      └→ queue → videoscale → appsink
  *                                            （预览，AI 推理同源）
  * 输入参数：@enc    - 编码器上下文（保存 pipeline/bus）
@@ -146,12 +215,18 @@ static int create_record_pipeline(gst_encoder_t *enc,
     GstElement *queue_rec = NULL;
     GstElement *queue_prev = NULL;
     GstElement *scale = NULL;
+    GstElement *tee2 = NULL;
+    GstElement *queue_nv12 = NULL;
+    GstElement *queue_bgra = NULL;
+    GstElement *videoconvert = NULL;
     GstElement *appsink = NULL;
+    GstElement *appsink_bgra = NULL;
     GstElement *encoder = NULL;
     GstElement *parser = NULL;
     GstElement *sink = NULL;
     GstCaps    *caps = NULL;
     GstCaps    *prev_caps = NULL;
+    GstCaps    *bgra_caps = NULL;
     GstAppSinkCallbacks cb;
 
     /* 创建流水线容器 */
@@ -162,7 +237,8 @@ static int create_record_pipeline(gst_encoder_t *enc,
 
     /* 创建各元件：
      * v4l2src 采集 / capsfilter 格式过滤 / tee 分流 /
-     * queue 缓冲隔离 / videoscale 预览缩放 / appsink 预览出口 /
+     * queue 缓冲隔离 / videoscale 预览缩放 / tee2 预览二次分流 /
+     * videoconvert NV12→BGRA / appsink 双出口 /
      * mpph264enc RK 硬件编码 / h264parse 码流整理 / splitmuxsink 分段封装 */
     src        = gst_element_factory_make("v4l2src",      "src");
     capsfilter = gst_element_factory_make("capsfilter",   "filter");
@@ -170,13 +246,20 @@ static int create_record_pipeline(gst_encoder_t *enc,
     queue_rec  = gst_element_factory_make("queue",        "queue_rec");
     queue_prev = gst_element_factory_make("queue",        "queue_prev");
     scale      = gst_element_factory_make("videoscale",   "preview_scale");
-    appsink    = gst_element_factory_make("appsink",      "preview_sink");
+    tee2       = gst_element_factory_make("tee",          "preview_tee");
+    queue_nv12 = gst_element_factory_make("queue",        "queue_nv12");
+    queue_bgra = gst_element_factory_make("queue",        "queue_bgra");
+    videoconvert = gst_element_factory_make("videoconvert", "preview_cvt");
+    appsink    = gst_element_factory_make("appsink",      "preview_sink_nv12");
+    appsink_bgra = gst_element_factory_make("appsink",    "preview_sink_bgra");
     encoder    = gst_element_factory_make("mpph264enc",   "encoder");
     parser     = gst_element_factory_make("h264parse",    "parser");
     sink       = gst_element_factory_make("splitmuxsink", "sink");
     if ((NULL == src) || (NULL == capsfilter) || (NULL == tee) ||
         (NULL == queue_rec) || (NULL == queue_prev) || (NULL == scale) ||
-        (NULL == appsink) || (NULL == encoder) || (NULL == parser) ||
+        (NULL == tee2) || (NULL == queue_nv12) || (NULL == queue_bgra) ||
+        (NULL == videoconvert) || (NULL == appsink) ||
+        (NULL == appsink_bgra) || (NULL == encoder) || (NULL == parser) ||
         (NULL == sink)) {
         LOG_E("GST", "创建 GStreamer 元件失败");
         goto error;
@@ -186,9 +269,6 @@ static int create_record_pipeline(gst_encoder_t *enc,
     g_object_set(G_OBJECT(src), "device", config->device, NULL);
     g_object_set(G_OBJECT(encoder), "bps", (guint)config->bitrate, NULL);
     g_object_set(G_OBJECT(encoder), "gop", (gint)config->fps, NULL);
-
-    /* splitmuxsink：命名模板/分段时长/序号接续 */
-    setup_sink_props(sink, config);
 
     /* 格式过滤：NV12 / 分辨率 / 帧率 */
     caps = gst_caps_new_simple(
@@ -205,7 +285,20 @@ static int create_record_pipeline(gst_encoder_t *enc,
     gst_caps_unref(caps);
     caps = NULL;
 
-    /* 预览分支：appsink 输出 caps（NV12 720p）+ 非同步 + 丢帧策略 */
+    /* ====== 预览分支低延迟配置 ======
+     * queue 默认缓冲 200 帧，下游消费慢会堆积数百毫秒延迟；
+     * 预览场景只要最新帧：全部队列限 1 帧 + leaky=downstream（丢最旧） */
+    g_object_set(G_OBJECT(queue_prev), "max-size-buffers",
+                 PREVIEW_QUEUE_BUFFERS, NULL);
+    g_object_set(G_OBJECT(queue_prev), "leaky", PREVIEW_QUEUE_LEAKY, NULL);
+    g_object_set(G_OBJECT(queue_nv12), "max-size-buffers",
+                 PREVIEW_QUEUE_BUFFERS, NULL);
+    g_object_set(G_OBJECT(queue_nv12), "leaky", PREVIEW_QUEUE_LEAKY, NULL);
+    g_object_set(G_OBJECT(queue_bgra), "max-size-buffers",
+                 PREVIEW_QUEUE_BUFFERS, NULL);
+    g_object_set(G_OBJECT(queue_bgra), "leaky", PREVIEW_QUEUE_LEAKY, NULL);
+
+    /* NV12 appsink（AI 推理出口） */
     prev_caps = gst_caps_new_simple(
         "video/x-raw",
         "format",    G_TYPE_STRING, "NV12",
@@ -220,25 +313,61 @@ static int create_record_pipeline(gst_encoder_t *enc,
     gst_caps_unref(prev_caps);
     prev_caps = NULL;
     g_object_set(G_OBJECT(appsink), "sync", FALSE, NULL);
-    g_object_set(G_OBJECT(appsink), "max-buffers", 2, NULL);
+    g_object_set(G_OBJECT(appsink), "max-buffers", 1, NULL);
     g_object_set(G_OBJECT(appsink), "drop", TRUE, NULL);
 
-    /* appsink 新帧回调（转交预览回调，AI 线程消费） */
     memset(&cb, 0, sizeof(cb));
     cb.new_sample = appsink_new_sample;
     gst_app_sink_set_callbacks(GST_APP_SINK(appsink), &cb, enc, NULL);
 
-    /* 组装：先 add（bin 接管元件所有权），后 link tee 双分支 */
+    /* BGRA appsink（UI 显示出口：videoconvert 在管线内完成转换，
+     * UI 零转换开销） */
+    bgra_caps = gst_caps_new_simple(
+        "video/x-raw",
+        "format",    G_TYPE_STRING, "BGRA",
+        "width",     G_TYPE_INT,    PREVIEW_BRANCH_W,
+        "height",    G_TYPE_INT,    PREVIEW_BRANCH_H,
+        "framerate", GST_TYPE_FRACTION, (int)config->fps, 1,
+        NULL);
+    if (NULL == bgra_caps) {
+        goto error;
+    }
+    g_object_set(G_OBJECT(appsink_bgra), "caps", bgra_caps, NULL);
+    gst_caps_unref(bgra_caps);
+    bgra_caps = NULL;
+    g_object_set(G_OBJECT(appsink_bgra), "sync", FALSE, NULL);
+    g_object_set(G_OBJECT(appsink_bgra), "max-buffers", 1, NULL);
+    g_object_set(G_OBJECT(appsink_bgra), "drop", TRUE, NULL);
+
+    memset(&cb, 0, sizeof(cb));
+    cb.new_sample = appsink_bgra_new_sample;
+    gst_app_sink_set_callbacks(GST_APP_SINK(appsink_bgra), &cb, enc, NULL);
+
+    /* 组装：先 add（bin 接管元件所有权），后 link tee 多分支
+     * 预览路：tee → queue → scale → tee2 ─→ queue → appsink(NV12→AI)
+     *                                   └→ queue → videoconvert → appsink(BGRA→UI) */
     gst_bin_add_many(GST_BIN(pipeline), src, capsfilter, tee,
-                     queue_rec, queue_prev, scale, appsink,
+                     queue_rec, queue_prev, scale, tee2,
+                     queue_nv12, queue_bgra, videoconvert,
+                     appsink, appsink_bgra,
                      encoder, parser, sink, NULL);
     if ((FALSE == gst_element_link(src, capsfilter)) ||
         (FALSE == gst_element_link(capsfilter, tee)) ||
         (FALSE == gst_element_link_many(tee, queue_rec, encoder,
                                         parser, sink, NULL)) ||
         (FALSE == gst_element_link_many(tee, queue_prev, scale,
-                                        appsink, NULL))) {
+                                        tee2, NULL)) ||
+        (FALSE == gst_element_link_many(tee2, queue_nv12,
+                                        appsink, NULL)) ||
+        (FALSE == gst_element_link_many(tee2, queue_bgra,
+                                        videoconvert, appsink_bgra, NULL))) {
         LOG_E("GST", "GStreamer 元件连接失败");
+        goto error;
+    }
+
+    /* splitmuxsink：稳健复用 muxer / 命名模板 / 分段时长 / 序号接续 */
+    if (0 != setup_sink_props(sink, config)) {
+        LOG_E("GST", "配置稳健复用 muxer 失败");
         goto error;
     }
 
@@ -249,6 +378,9 @@ static int create_record_pipeline(gst_encoder_t *enc,
 
 error:
     /* 元件已入 bin 由 pipeline 析构释放，这里只释放 caps 和 pipeline */
+    if (NULL != bgra_caps) {
+        gst_caps_unref(bgra_caps);
+    }
     if (NULL != prev_caps) {
         gst_caps_unref(prev_caps);
     }
@@ -277,6 +409,27 @@ void gst_encoder_set_preview_cb(gst_encoder_t *enc,
 
     enc->preview_cb = cb;
     enc->preview_user_data = user_data;
+}
+
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_set_preview_bgra_cb
+ * 功能描述：注册 BGRA 预览帧回调（videoconvert 分支，UI 显示用）
+ * 输入参数：@enc       - 编码器上下文
+ *           @cb        - 回调函数（NULL 取消）
+ *           @user_data - 回调上下文
+ * 注意事项：BGRA 由管线内 videoconvert 完成，UI 侧零转换开销
+ *****************************************************************************/
+void gst_encoder_set_preview_bgra_cb(gst_encoder_t *enc,
+                                     gst_preview_frame_cb cb,
+                                     void *user_data)
+{
+    if (NULL == enc) {
+        return;
+    }
+
+    enc->preview_bgra_cb = cb;
+    enc->preview_bgra_user_data = user_data;
 }
 
 

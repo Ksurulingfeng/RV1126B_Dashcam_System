@@ -37,7 +37,7 @@
 #define AI_PERSON_CLEAR_STREAK 15
 
 /* 预览帧 NV12 缓冲（GStreamer appsink 输出，与录像同源） */
-static uint8_t s_nv12_buf[PREVIEW_SIZE];
+static uint8_t s_nv12_buf[PREVIEW_NV12_SIZE];
 
 /* 无新帧时的轮询间隔（微秒）：30fps 帧间隔 33ms，
  * 5ms 轮询在响应速度与 CPU 占用间取平衡，防止忙等烧核 */

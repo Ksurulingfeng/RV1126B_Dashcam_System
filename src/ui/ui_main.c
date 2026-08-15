@@ -44,11 +44,14 @@ static lv_obj_t* s_label_time;
 static lv_obj_t* s_label_gps;
 static lv_obj_t* s_canvas;
 
-/* canvas 帧缓冲（1280×720 BGRA，全屏预览） */
+/* canvas 帧缓冲（1280×720 BGRA，全屏预览）。
+ * 依赖 LV_COLOR_DEPTH=32 使 lv_color_t 为 4 字节 BGRA 布局，
+ * 与 DRM 后端（disp_bit 32）及 GStreamer BGRA 输出三者保持一致，
+ * 任意一方变更需同步检查此耦合 */
 static lv_color_t* s_canvas_buf;
 
-/* 预览原始帧缓冲（NV12，UI 线程专用；BGRA 直接写入 canvas 缓冲） */
-static uint8_t s_nv12_buf[PREVIEW_SIZE];
+/* 预览帧缓冲（BGRA，GStreamer 管线内 videoconvert 已转换，UI 零转换） */
+static uint8_t s_bgra_buf[PREVIEW_BGRA_SIZE];
 
 /* UI 已读预览帧序号（多消费者模式，与 AI 线程各自独立） */
 static uint32_t s_ui_frame_id = 0;
@@ -102,65 +105,6 @@ static void ui_status_tick(lv_timer_t* timer)
 }
 
 /*****************************************************************************
- * 函数名称：nv12_to_bgra
- * 功能描述：NV12 转 BGRA（标准 YUV→RGB 公式，整型运算）
- * 输入参数：@nv12   - NV12 数据（Y 平面 + UV 交错平面）
- * 输出参数：@bgra   - 输出 BGRA（调用者分配 width*height*4）
- *           @width/@height - 帧尺寸
- * 注意事项：色度按 2×2 块采样（NV12 420 格式），像素间共享 UV
- *****************************************************************************/
-static void nv12_to_bgra(const uint8_t* nv12, uint8_t* bgra,
-                         int width, int height)
-{
-    const uint8_t* y_plane = nv12;
-    const uint8_t* uv_plane = nv12 + width * height;
-    int y;
-    int x;
-
-    for (y = 0; y < height; y++) {
-        for (x = 0; x < width; x++) {
-            int y_val = y_plane[y * width + x] - 16;
-            int u_val = uv_plane[(y / 2) * width + (x & ~1)] - 128;
-            int v_val = uv_plane[(y / 2) * width + (x & ~1) + 1] - 128;
-            int r;
-            int g;
-            int b;
-            uint8_t* dst = bgra + (y * width + x) * 4;
-
-            if (0 > y_val) {
-                y_val = 0;
-            }
-            r = (298 * y_val + 409 * v_val + 128) >> 8;
-            g = (298 * y_val - 100 * u_val - 208 * v_val + 128) >> 8;
-            b = (298 * y_val + 516 * u_val + 128) >> 8;
-            if (0 > r) {
-                r = 0;
-            }
-            if (255 < r) {
-                r = 255;
-            }
-            if (0 > g) {
-                g = 0;
-            }
-            if (255 < g) {
-                g = 255;
-            }
-            if (0 > b) {
-                b = 0;
-            }
-            if (255 < b) {
-                b = 255;
-            }
-
-            dst[0] = (uint8_t)b;
-            dst[1] = (uint8_t)g;
-            dst[2] = (uint8_t)r;
-            dst[3] = 0xFF;
-        }
-    }
-}
-
-/*****************************************************************************
  * 函数名称：ui_draw_detect_boxes
  * 功能描述：在 canvas 上绘制检测框（绿色描边矩形）
  * 输入参数：@boxes - 检测框数组
@@ -201,11 +145,10 @@ static void ui_frame_tick(lv_timer_t* timer)
         return;
     }
 
-    /* 有新帧 → NV12→BGRA 直写 canvas（lv_color_t 32 位即 BGRA 字节序；
-     * 先拷帧再画框，避免旧框残影） */
-    if (preview_share_pop(ui->preview_share, s_nv12_buf, &s_ui_frame_id)) {
-        nv12_to_bgra(s_nv12_buf, (uint8_t*)s_canvas_buf,
-                     PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    /* 有新帧 → BGRA 直拷 canvas（管线内已转换；先拷帧再画框避免旧框残影） */
+    if (preview_share_pop(ui->preview_share, s_bgra_buf, &s_ui_frame_id)) {
+        memcpy(s_canvas_buf, s_bgra_buf,
+               sizeof(lv_color_t) * PREVIEW_WIDTH * PREVIEW_HEIGHT);
 
         /* AI 在线时叠加最新检测框 */
         if ((NULL != ui->detect_share) &&
@@ -502,7 +445,7 @@ static void ui_build_live_page(ui_worker_t* ui)
 
     /* 状态刷新（1s）+ 帧刷新（33ms） */
     lv_timer_create(ui_status_tick, 1000, ui);
-    lv_timer_create(ui_frame_tick, 33, ui);
+    lv_timer_create(ui_frame_tick, 16, ui);
 }
 
 /*****************************************************************************

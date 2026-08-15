@@ -27,17 +27,19 @@ typedef struct {
 } gst_encoder_config_t;
 
 /* 预览帧回调：appsink 收到新帧时调用（GStreamer 内部线程）
- * @nv12      - NV12 数据（PREVIEW_WIDTH×HEIGHT，调用方尽快拷贝）
+ * @data      - 帧数据（格式由注册接口决定）
  * @user_data - 注册时传入的上下文
  * 注意事项：回调在 GStreamer 内部线程执行，必须快速返回（仅拷贝） */
-typedef void (*gst_preview_frame_cb)(const uint8_t *nv12, void *user_data);
+typedef void (*gst_preview_frame_cb)(const uint8_t *data, void *user_data);
 
 /* 录像编码器上下文 */
 typedef struct {
     GstElement *pipeline;   /* 编码流水线 */
     GstBus     *bus;        /* 消息总线（错误/EOS 监控） */
-    gst_preview_frame_cb preview_cb; /* 预览帧回调（tee 分支 appsink） */
-    void *preview_user_data;         /* 回调上下文 */
+    gst_preview_frame_cb preview_cb;       /* NV12 预览帧回调（AI 推理） */
+    void *preview_user_data;               /* NV12 回调上下文 */
+    gst_preview_frame_cb preview_bgra_cb;  /* BGRA 预览帧回调（UI 显示） */
+    void *preview_bgra_user_data;          /* BGRA 回调上下文 */
 } gst_encoder_t;
 
 /*****************************************************************************
@@ -68,7 +70,7 @@ void gst_encoder_stop(gst_encoder_t *enc);
 
 /*****************************************************************************
  * 函数名称：gst_encoder_set_preview_cb
- * 功能描述：注册预览帧回调（tee 分支 appsink 新帧触发）
+ * 功能描述：注册 NV12 预览帧回调（tee 分支 appsink 新帧触发，AI 推理用）
  * 输入参数：@enc       - 编码器上下文
  *           @cb        - 回调函数（NULL 取消）
  *           @user_data - 回调上下文
@@ -77,6 +79,19 @@ void gst_encoder_stop(gst_encoder_t *enc);
  *****************************************************************************/
 void gst_encoder_set_preview_cb(gst_encoder_t *enc,
                                 gst_preview_frame_cb cb, void *user_data);
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_set_preview_bgra_cb
+ * 功能描述：注册 BGRA 预览帧回调（videoconvert 分支，UI 显示用）
+ * 输入参数：@enc       - 编码器上下文
+ *           @cb        - 回调函数（NULL 取消）
+ *           @user_data - 回调上下文
+ * 注意事项：BGRA 由 GStreamer 管线内 videoconvert 完成，
+ *           UI 侧零转换开销；回调同样必须快速返回
+ *****************************************************************************/
+void gst_encoder_set_preview_bgra_cb(gst_encoder_t *enc,
+                                     gst_preview_frame_cb cb,
+                                     void *user_data);
 
 /*****************************************************************************
  * 函数名称：gst_encoder_deinit
