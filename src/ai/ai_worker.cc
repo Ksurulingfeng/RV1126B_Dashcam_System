@@ -22,6 +22,7 @@
 #include "preprocess.h"
 
 #include "log.h"
+#include "settings.h"
 
 /* 日志打印间隔（帧），避免每帧 printf 刷屏 */
 #define AI_LOG_INTERVAL 30
@@ -445,6 +446,7 @@ static void loop_person_state(ai_loop_ctx_t* lc,
     }
 
     if ((AI_PERSON_LOCK_STREAK <= lc->person_streak) &&
+        settings_get_ai_auto_lock() &&
         (false == lc->is_person_locked) && (NULL != lc->worker->file_mgr)) {
         char latest_path[FILE_PATH_MAX];
 

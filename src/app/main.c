@@ -21,6 +21,7 @@
 #include "gst_encoder.h"
 #include "gps_worker.h"
 #include "preview_share.h"
+#include "settings.h"
 #include "thread_mgr.h"
 #include "ui_main.h"
 
@@ -62,6 +63,13 @@
 
 /* 系统退出标志（信号处理函数设置） */
 static volatile bool s_is_running = true;
+
+/* 设置应用巡检记忆值（变化时应用到编码器） */
+static bool s_last_record_enabled = true;
+static uint32_t s_last_segment_sec = 0;
+
+/* 配置文件路径 */
+#define CONF_PATH "/root/RV1126B_Dashcam_System/config/dashcam.conf"
 
 /*****************************************************************************
  * 函数名称：preview_frame_cb
@@ -147,7 +155,8 @@ static int system_init(void)
     preview_share_init(&s_preview_bgra_share, PREVIEW_BGRA_SIZE);
 
 #if FILE_ON /* 文件管理器 */
-    if (0 != file_mgr_init(&s_file_mgr, RECORD_DIR, MAX_STORAGE)) {
+    if (0 != file_mgr_init(&s_file_mgr, RECORD_DIR, MAX_STORAGE,
+                           VIDEO_BITRATE)) {
         LOG_E("MAIN", "文件管理器初始化失败");
         goto cleanup;
     }
@@ -285,6 +294,9 @@ int main(int argc, char* argv[])
         goto error;
     }
 
+    /* 设置加载（失败时内部用默认值继续） */
+    settings_init(CONF_PATH);
+
     if (0 != system_init()) {
         LOG_E("MAIN", "系统初始化失败");
         goto error;
@@ -304,9 +316,25 @@ int main(int argc, char* argv[])
 #endif
 
     /* 主循环：编码在 GStreamer 内部线程跑，GPS 在业务线程跑，
-     * 主线程每秒巡检一次文件系统（新文件入队 + 超限删除） */
+     * 主线程每秒巡检一次文件系统（新文件入队 + 超限删除），
+     * 并把设置页改动的录像开关/分段时长应用到编码器 */
     while (s_is_running) {
         sleep(1);
+
+        /* 设置应用：变化时才调编码器（设置页改动后 ≤1 秒生效） */
+#if GST_ON
+        if (settings_get_record_enabled() != s_last_record_enabled) {
+            gst_encoder_set_record_enabled(&s_encoder,
+                                           settings_get_record_enabled());
+            s_last_record_enabled = settings_get_record_enabled();
+        }
+        if (settings_get_segment_sec() != s_last_segment_sec) {
+            gst_encoder_set_segment_sec(&s_encoder,
+                                        settings_get_segment_sec());
+            s_last_segment_sec = settings_get_segment_sec();
+        }
+#endif
+
 #if FILE_ON
         if (0 != file_mgr_check(&s_file_mgr)) {
             LOG_W("MAIN", "文件巡检失败（SD 卡异常？）");

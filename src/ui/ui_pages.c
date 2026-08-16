@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "thumb_pipeline.h"
+#include "settings.h"
 #include "ui_pages.h"
 
 /* 主题颜色（简约风格：深灰黑 + 白灰文字，彩色仅 REC 红） */
@@ -241,24 +242,43 @@ static void ui_library_add_row(lv_obj_t* parent, const video_entry_t* entry)
                THUMB_PIPELINE_W * THUMB_H);
         lv_canvas_set_buffer(thumb, thumb_buf, THUMB_PIPELINE_W,
                              THUMB_H, LV_IMG_CF_TRUE_COLOR);
+
+        /* BMP 已生成则同步加载：程序重启后完成队列是空的，
+         * 但磁盘上的 BMP 保留，幂等跳过请求会让 UI 永远
+         * 看不到已生成的缩略图 */
+        {
+            char bmp_path[FILE_PATH_MAX];
+
+            thumb_pipeline_bmp_path(entry->filepath, bmp_path);
+            if (bmp_load_to_canvas(thumb_buf, bmp_path)) {
+                lv_obj_invalidate(thumb);
+            }
+        }
     }
     lv_obj_align(thumb, LV_ALIGN_LEFT_MID, 16, 0);
     lv_obj_set_style_radius(thumb, 8, 0);
     lv_obj_set_style_clip_corner(thumb, true, 0);
 
-    /* 文件名（白字，缩略图右侧） */
-    strncpy(name_buf, entry->filepath, sizeof(name_buf) - 1);
-    name_buf[sizeof(name_buf) - 1] = '\0';
+    /* 文件名（白字，只显示文件名不显示路径） */
+    {
+        const char* slash = strrchr(entry->filepath, '/');
+
+        strncpy(name_buf,
+                (NULL == slash) ? entry->filepath : slash + 1,
+                sizeof(name_buf) - 1);
+        name_buf[sizeof(name_buf) - 1] = '\0';
+    }
     label = lv_label_create(row);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, 200, -16);
     lv_obj_add_style(label, &s_style_text_w, 0);
     lv_label_set_text(label, name_buf);
 
-    /* 时间 + 大小（灰字） */
+    /* 时间 + 时长（mm:ss）+ 大小（灰字） */
     tm_info = localtime(&entry->timestamp);
     strftime(info_buf, 32, "%m-%d %H:%M", tm_info);
     snprintf(info_buf + strlen(info_buf), sizeof(info_buf) - strlen(info_buf),
-             "  %llu MB",
+             "  %02u:%02u  %llu MB",
+             entry->duration_sec / 60, entry->duration_sec % 60,
              (unsigned long long)(entry->size / 1024 / 1024));
     label = lv_label_create(row);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, 200, 16);
@@ -365,9 +385,10 @@ static void ui_library_rebuild(void)
     s_lib_last_count = total;
     s_lib_last_page = s_lib_page;
 
+    /* skip_tail：正在录的分段未封口（无 moov），不显示在文件库 */
     count = file_mgr_get_list(s_lib_ui->file_mgr, entries,
                               UI_LIBRARY_MAX_ITEMS,
-                              s_lib_page * UI_LIBRARY_MAX_ITEMS);
+                              s_lib_page * UI_LIBRARY_MAX_ITEMS, true);
     if (0 > count) {
         return;
     }
@@ -460,24 +481,23 @@ lv_obj_t* ui_page_library_create(ui_worker_t* ui)
     bar = ui_page_title_bar(content, "录像文件库");
     s_lib_title = lv_obj_get_child(bar, 0);
 
-    /* 翻页按钮（顶栏左右两端，符号字体渲染箭头） */
+    /* 翻页按钮（顶栏左右两端，88×56 达触摸规范；
+     * 符号用默认字体渲染——freetype 字体没有符号字形会乱码） */
     {
         lv_obj_t* btn_prev = lv_btn_create(bar);
         lv_obj_t* btn_next = lv_btn_create(bar);
         lv_obj_t* lbl_prev = lv_label_create(btn_prev);
         lv_obj_t* lbl_next = lv_label_create(btn_next);
 
-        lv_obj_set_size(btn_prev, 45, 45);
-        lv_obj_set_size(btn_next, 45, 45);
-        lv_obj_align(btn_prev, LV_ALIGN_LEFT_MID, 8, 0);
-        lv_obj_align(btn_next, LV_ALIGN_RIGHT_MID, -8, 0);
+        lv_obj_set_size(btn_prev, 88, UI_PAGE_TOP_BAR_H);
+        lv_obj_set_size(btn_next, 88, UI_PAGE_TOP_BAR_H);
+        lv_obj_align(btn_prev, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_align(btn_next, LV_ALIGN_RIGHT_MID, 0, 0);
         lv_obj_add_style(btn_prev, &s_style_trans, 0);
         lv_obj_add_style(btn_next, &s_style_trans, 0);
 
         lv_obj_center(lbl_prev);
         lv_obj_center(lbl_next);
-        lv_obj_add_style(lbl_prev, &s_style_text_g, 0);
-        lv_obj_add_style(lbl_next, &s_style_text_g, 0);
         lv_label_set_text(lbl_prev, LV_SYMBOL_LEFT);
         lv_label_set_text(lbl_next, LV_SYMBOL_RIGHT);
 
@@ -567,7 +587,7 @@ static lv_obj_t* ui_settings_group_create(lv_obj_t* parent, const char* title)
 
     lv_obj_set_size(card, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_add_style(card, &s_style_card, 0);
-    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
     lv_obj_set_style_pad_row(card, 4, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
@@ -577,6 +597,155 @@ static lv_obj_t* ui_settings_group_create(lv_obj_t* parent, const char* title)
     lv_label_set_text(label, title);
 
     return card;
+}
+
+/* 设置开关标识（回调 user_data 区分） */
+typedef enum {
+    SETTINGS_SW_AI_DRAW, /* AI 检测框绘制 */
+    SETTINGS_SW_AI_LOCK, /* person 紧急自动锁定 */
+    SETTINGS_SW_RECORD,  /* 录像 */
+    SETTINGS_SW_AUDIO,   /* 录音（占位） */
+} settings_sw_id_t;
+
+/*****************************************************************************
+ * 函数名称：settings_switch_cb
+ * 功能描述：设置开关值变化回调——写配置并持久化
+ * 输入参数：@e - 事件（user_data 为 settings_sw_id_t 标识）
+ * 注意事项：录像/分段时长的实际应用由主循环每秒巡检完成，
+ *           此处只负责配置存储（解耦 UI 与编码器）
+ *****************************************************************************/
+static void settings_switch_cb(lv_event_t* e)
+{
+    lv_obj_t* sw = lv_event_get_target(e);
+    settings_sw_id_t id = (settings_sw_id_t)(intptr_t)
+                          lv_event_get_user_data(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+
+    switch (id) {
+        case SETTINGS_SW_AI_DRAW:
+            settings_set_ai_draw_box(on);
+            break;
+        case SETTINGS_SW_AI_LOCK:
+            settings_set_ai_auto_lock(on);
+            break;
+        case SETTINGS_SW_RECORD:
+            settings_set_record_enabled(on);
+            break;
+        case SETTINGS_SW_AUDIO:
+            settings_set_audio_enabled(on);
+            break;
+        default:
+            break;
+    }
+    settings_save();
+}
+
+/*****************************************************************************
+ * 函数名称：ui_settings_add_switch
+ * 功能描述：向分组卡片添加一行开关（左标签 + 右 lv_switch）
+ * 输入参数：@parent   - 分组卡片
+ *           @key      - 开关名称
+ *           @initial  - 初始开关状态
+ *           @disabled - 禁用（占位功能用，灰色不可点）
+ *           @id       - 回调标识（settings_sw_id_t）
+ *****************************************************************************/
+static void ui_settings_add_switch(lv_obj_t* parent, const char* key,
+                                   bool initial, bool disabled,
+                                   settings_sw_id_t id)
+{
+    lv_obj_t* row = lv_obj_create(parent);
+    lv_obj_t* label;
+    lv_obj_t* sw;
+
+    lv_obj_set_size(row, lv_pct(100), 44);
+    lv_obj_add_style(row, &s_style_trans, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    label = lv_label_create(row);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 4, 0);
+    lv_obj_add_style(label, &s_style_text_w, 0);
+    lv_label_set_text(label, key);
+
+    sw = lv_switch_create(row);
+    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -4, 0);
+    if (initial) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    }
+    if (disabled) {
+        lv_obj_add_state(sw, LV_STATE_DISABLED);
+        lv_obj_add_style(label, &s_style_text_g, 0);
+    } else {
+        lv_obj_add_event_cb(sw, settings_switch_cb, LV_EVENT_VALUE_CHANGED,
+                            (void*)(intptr_t)id);
+    }
+}
+
+/* 分段时长选项（秒） */
+#define SEGMENT_CHOICE_1 60
+#define SEGMENT_CHOICE_2 120
+#define SEGMENT_CHOICE_3 300
+
+/*****************************************************************************
+ * 函数名称：segment_btn_cb
+ * 功能描述：分段时长选择回调——写配置并持久化（主循环应用生效）
+ * 输入参数：@e - 事件（user_data 为秒数）
+ *****************************************************************************/
+static void segment_btn_cb(lv_event_t* e)
+{
+    uint32_t sec = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+
+    settings_set_segment_sec(sec);
+    settings_save();
+}
+
+/*****************************************************************************
+ * 函数名称：ui_settings_add_segment_row
+ * 功能描述：向分组卡片添加分段时长选择行（1/2/5 分钟三按钮）
+ * 输入参数：@parent - 分组卡片
+ *****************************************************************************/
+static void ui_settings_add_segment_row(lv_obj_t* parent)
+{
+    lv_obj_t* row = lv_obj_create(parent);
+    lv_obj_t* label;
+    lv_obj_t* btn1;
+    lv_obj_t* btn2;
+    lv_obj_t* btn3;
+
+    lv_obj_set_size(row, lv_pct(100), 56);
+    lv_obj_add_style(row, &s_style_trans, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    label = lv_label_create(row);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 4, 0);
+    lv_obj_add_style(label, &s_style_text_w, 0);
+    lv_label_set_text(label, "分段时长");
+
+    btn1 = lv_btn_create(row);
+    btn2 = lv_btn_create(row);
+    btn3 = lv_btn_create(row);
+    lv_obj_set_size(btn1, 64, 44);
+    lv_obj_set_size(btn2, 64, 44);
+    lv_obj_set_size(btn3, 64, 44);
+    lv_obj_align(btn3, LV_ALIGN_RIGHT_MID, -4, 0);
+    lv_obj_align_to(btn2, btn3, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+    lv_obj_align_to(btn1, btn2, LV_ALIGN_OUT_LEFT_MID, -8, 0);
+
+    label = lv_label_create(btn1);
+    lv_obj_center(label);
+    lv_label_set_text(label, "1分");
+    label = lv_label_create(btn2);
+    lv_obj_center(label);
+    lv_label_set_text(label, "2分");
+    label = lv_label_create(btn3);
+    lv_obj_center(label);
+    lv_label_set_text(label, "5分");
+
+    lv_obj_add_event_cb(btn1, segment_btn_cb, LV_EVENT_CLICKED,
+                        (void*)(uintptr_t)SEGMENT_CHOICE_1);
+    lv_obj_add_event_cb(btn2, segment_btn_cb, LV_EVENT_CLICKED,
+                        (void*)(uintptr_t)SEGMENT_CHOICE_2);
+    lv_obj_add_event_cb(btn3, segment_btn_cb, LV_EVENT_CLICKED,
+                        (void*)(uintptr_t)SEGMENT_CHOICE_3);
 }
 
 /*****************************************************************************
@@ -590,7 +759,8 @@ lv_obj_t* ui_page_settings_create(ui_worker_t* ui)
     lv_obj_t* page = lv_obj_create(NULL);
     lv_obj_t* content;
     lv_obj_t* card;
-    char buf[64];
+    char buf[96];
+    int y = UI_PAGE_TOP_BAR_H + 12;
 
     ui_pages_styles_init(ui->font);
 
@@ -599,28 +769,41 @@ lv_obj_t* ui_page_settings_create(ui_worker_t* ui)
     content = ui_page_content_create(page);
     ui_page_title_bar(content, "设置");
 
+    /* 功能开关分组 */
+    card = ui_settings_group_create(content, "功能开关");
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, y);
+    ui_settings_add_switch(card, "AI 识别画框", settings_get_ai_draw_box(),
+                           false, SETTINGS_SW_AI_DRAW);
+    ui_settings_add_switch(card, "紧急自动锁定", settings_get_ai_auto_lock(),
+                           false, SETTINGS_SW_AI_LOCK);
+    ui_settings_add_switch(card, "录像", settings_get_record_enabled(),
+                           false, SETTINGS_SW_RECORD);
+    ui_settings_add_switch(card, "录音（开发中）",
+                           settings_get_audio_enabled(),
+                           true, SETTINGS_SW_AUDIO);
+
     /* 录像参数分组 */
+    y += 260;
     card = ui_settings_group_create(content, "录像参数");
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, UI_PAGE_TOP_BAR_H + 16);
-    ui_settings_add_item(card, "分辨率", "1920×1080 @30fps");
-    ui_settings_add_item(card, "码率", "8 Mbps");
-    ui_settings_add_item(card, "分段时长", "5 分钟");
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, y);
+    ui_settings_add_item(card, "画面", "1920×1080 @30fps · 8Mbps");
+    ui_settings_add_segment_row(card);
 
     /* 存储分组 */
+    y += 170;
     card = ui_settings_group_create(content, "存储");
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, UI_PAGE_TOP_BAR_H + 210);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, y);
     snprintf(buf, sizeof(buf), "%d 个文件 / %llu MB",
              file_mgr_get_count(ui->file_mgr),
              (unsigned long long)(file_mgr_get_used(ui->file_mgr)
                                   / 1024 / 1024));
     ui_settings_add_item(card, "SD 卡", buf);
-    ui_settings_add_item(card, "格式化", "开发中");
 
     /* 关于分组 */
+    y += 100;
     card = ui_settings_group_create(content, "关于");
-    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, UI_PAGE_TOP_BAR_H + 390);
-    ui_settings_add_item(card, "固件版本", "v0.4.0");
-    ui_settings_add_item(card, "平台", "RV1126B + IMX415");
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, y);
+    ui_settings_add_item(card, "版本 / 平台", "v0.4.0 · RV1126B + IMX415");
 
     /* 右侧导航栏（全局组件） */
     ui_nav_bar_create(page, ui);

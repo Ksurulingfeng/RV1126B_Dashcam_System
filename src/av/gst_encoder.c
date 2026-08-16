@@ -186,6 +186,7 @@ static int create_record_pipeline(gst_encoder_t *enc,
     GstElement *src = NULL;
     GstElement *capsfilter = NULL;
     GstElement *tee = NULL;
+    GstElement *record_valve = NULL;
     GstElement *queue_rec = NULL;
     GstElement *queue_prev = NULL;
     GstElement *scale = NULL;
@@ -217,6 +218,7 @@ static int create_record_pipeline(gst_encoder_t *enc,
     src        = gst_element_factory_make("v4l2src",      "src");
     capsfilter = gst_element_factory_make("capsfilter",   "filter");
     tee        = gst_element_factory_make("tee",          "tee");
+    record_valve = gst_element_factory_make("valve",      "record_valve");
     queue_rec  = gst_element_factory_make("queue",        "queue_rec");
     queue_prev = gst_element_factory_make("queue",        "queue_prev");
     scale      = gst_element_factory_make("videoscale",   "preview_scale");
@@ -230,7 +232,8 @@ static int create_record_pipeline(gst_encoder_t *enc,
     parser     = gst_element_factory_make("h264parse",    "parser");
     sink       = gst_element_factory_make("splitmuxsink", "sink");
     if ((NULL == src) || (NULL == capsfilter) || (NULL == tee) ||
-        (NULL == queue_rec) || (NULL == queue_prev) || (NULL == scale) ||
+        (NULL == record_valve) || (NULL == queue_rec) ||
+        (NULL == queue_prev) || (NULL == scale) ||
         (NULL == tee2) || (NULL == queue_nv12) || (NULL == queue_bgra) ||
         (NULL == videoconvert) || (NULL == appsink) ||
         (NULL == appsink_bgra) || (NULL == encoder) || (NULL == parser) ||
@@ -318,17 +321,18 @@ static int create_record_pipeline(gst_encoder_t *enc,
     gst_app_sink_set_callbacks(GST_APP_SINK(appsink_bgra), &cb, enc, NULL);
 
     /* 组装：先 add（bin 接管元件所有权），后 link tee 多分支
+     * 录像路：tee → valve → queue → encoder → parser → splitmuxsink
      * 预览路：tee → queue → scale → tee2 ─→ queue → appsink(NV12→AI)
      *                                   └→ queue → videoconvert → appsink(BGRA→UI) */
     gst_bin_add_many(GST_BIN(pipeline), src, capsfilter, tee,
-                     queue_rec, queue_prev, scale, tee2,
+                     record_valve, queue_rec, queue_prev, scale, tee2,
                      queue_nv12, queue_bgra, videoconvert,
                      appsink, appsink_bgra,
                      encoder, parser, sink, NULL);
     if ((FALSE == gst_element_link(src, capsfilter)) ||
         (FALSE == gst_element_link(capsfilter, tee)) ||
-        (FALSE == gst_element_link_many(tee, queue_rec, encoder,
-                                        parser, sink, NULL)) ||
+        (FALSE == gst_element_link_many(tee, record_valve, queue_rec,
+                                        encoder, parser, sink, NULL)) ||
         (FALSE == gst_element_link_many(tee, queue_prev, scale,
                                         tee2, NULL)) ||
         (FALSE == gst_element_link_many(tee2, queue_nv12,
@@ -338,6 +342,11 @@ static int create_record_pipeline(gst_encoder_t *enc,
         LOG_E("GST", "GStreamer 元件连接失败");
         goto error;
     }
+
+    /* 保存录像阀门与 sink 引用（bin 持有所有权，此处仅借用，
+     * 供运行时开关录像/调分段时长） */
+    enc->record_valve = record_valve;
+    enc->record_sink  = sink;
 
     /* splitmuxsink：命名模板 / 分段时长 / 序号接续 */
     if (0 != setup_sink_props(sink, config)) {
@@ -508,6 +517,44 @@ void gst_encoder_stop(gst_encoder_t *enc)
 
 
 /*****************************************************************************
+ * 函数名称：gst_encoder_set_record_enabled
+ * 功能描述：录像开关（valve 数据闸门：关闭时预览继续、录像暂停，
+ *           重开无缝续录当前分段）
+ * 输入参数：@enc     - 编码器上下文
+ *           @enabled - 是否录像
+ *****************************************************************************/
+void gst_encoder_set_record_enabled(gst_encoder_t *enc, bool enabled)
+{
+    if ((NULL == enc) || (NULL == enc->record_valve)) {
+        return;
+    }
+
+    /* valve drop=true 时数据不再流向编码分支，splitmuxsink
+     * 等待数据（当前段不封口），重开后无缝续录 */
+    g_object_set(G_OBJECT(enc->record_valve), "drop", !enabled, NULL);
+    LOG_I("GST", "录像%s", enabled ? "开启" : "暂停");
+}
+
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_set_segment_sec
+ * 功能描述：运行时调整分段时长（splitmuxsink max-size-time）
+ * 输入参数：@enc - 编码器上下文
+ *           @sec - 分段时长（秒）
+ *****************************************************************************/
+void gst_encoder_set_segment_sec(gst_encoder_t *enc, uint32_t sec)
+{
+    if ((NULL == enc) || (NULL == enc->record_sink) || (0 == sec)) {
+        return;
+    }
+
+    g_object_set(G_OBJECT(enc->record_sink), "max-size-time",
+                 (guint64)sec * GST_SECOND, NULL);
+    LOG_I("GST", "分段时长调整为 %u 秒", sec);
+}
+
+
+/*****************************************************************************
  * 函数名称：gst_encoder_deinit
  * 功能描述：销毁流水线，释放全部资源
  * 输入参数：@enc - 编码器上下文
@@ -531,4 +578,8 @@ void gst_encoder_deinit(gst_encoder_t *enc)
         gst_object_unref(enc->pipeline);
         enc->pipeline = NULL;
     }
+
+    /* valve/sink 由 bin 析构释放，这里只清引用 */
+    enc->record_valve = NULL;
+    enc->record_sink  = NULL;
 }

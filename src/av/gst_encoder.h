@@ -11,6 +11,7 @@
 #ifndef GST_ENCODER_H
 #define GST_ENCODER_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include <gst/gst.h>
@@ -34,8 +35,10 @@ typedef void (*gst_preview_frame_cb)(const uint8_t *data, void *user_data);
 
 /* 录像编码器上下文 */
 typedef struct {
-    GstElement *pipeline;   /* 编码流水线 */
-    GstBus     *bus;        /* 消息总线（错误/EOS 监控） */
+    GstElement *pipeline;      /* 编码流水线 */
+    GstBus     *bus;           /* 消息总线（错误/EOS 监控） */
+    GstElement *record_valve;  /* 录像阀门（tee→valve→编码，开关录像用） */
+    GstElement *record_sink;   /* splitmuxsink（运行时调分段时长） */
     gst_preview_frame_cb preview_cb;       /* NV12 预览帧回调（AI 推理） */
     void *preview_user_data;               /* NV12 回调上下文 */
     gst_preview_frame_cb preview_bgra_cb;  /* BGRA 预览帧回调（UI 显示） */
@@ -99,5 +102,22 @@ void gst_encoder_set_preview_bgra_cb(gst_encoder_t *enc,
  * 输入参数：@enc - 编码器上下文
  *****************************************************************************/
 void gst_encoder_deinit(gst_encoder_t *enc);
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_set_record_enabled
+ * 功能描述：录像开关（valve 数据闸门：关闭时预览继续、录像暂停，
+ *           重开无缝续录当前分段）
+ * 输入参数：@enc     - 编码器上下文
+ *           @enabled - 是否录像
+ *****************************************************************************/
+void gst_encoder_set_record_enabled(gst_encoder_t *enc, bool enabled);
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_set_segment_sec
+ * 功能描述：运行时调整分段时长（splitmuxsink max-size-time）
+ * 输入参数：@enc - 编码器上下文
+ *           @sec - 分段时长（秒）
+ *****************************************************************************/
+void gst_encoder_set_segment_sec(gst_encoder_t *enc, uint32_t sec);
 
 #endif /* GST_ENCODER_H */

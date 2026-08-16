@@ -18,6 +18,7 @@
 #include "display/drm.h"
 
 #include "log.h"
+#include "settings.h"
 #include "thumb_pipeline.h"
 #include "touch_input.h"
 #include "ui_main.h"
@@ -189,8 +190,8 @@ static void ui_frame_tick(lv_timer_t* timer)
         memcpy(s_canvas_buf, s_bgra_buf,
                sizeof(lv_color_t) * PREVIEW_WIDTH * PREVIEW_HEIGHT);
 
-        /* AI 在线时叠加最新检测框 */
-        if ((NULL != ui->detect_share) &&
+        /* AI 在线且画框开关开启时叠加最新检测框 */
+        if (settings_get_ai_draw_box() && (NULL != ui->detect_share) &&
             detect_share_pop(ui->detect_share, boxes, &box_count)) {
             ui_draw_detect_boxes(boxes, box_count);
         }
