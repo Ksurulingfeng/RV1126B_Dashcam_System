@@ -42,9 +42,12 @@ static bool s_styles_ready = false;
 
 /* 文件库页面状态 */
 static lv_obj_t* s_lib_list;        /* 列表容器（滚动） */
-static lv_obj_t* s_lib_title;       /* 标题（含文件数） */
+static lv_obj_t* s_lib_title;       /* 标题（含文件数/页码） */
 static ui_worker_t* s_lib_ui;       /* 数据源 */
-static int s_lib_last_count = -1;   /* 上次渲染的文件数 */
+static int s_lib_last_count = -1;   /* 上次渲染的文件总数 */
+static int s_lib_page = 0;          /* 当前页码（0 起） */
+static int s_lib_page_max = 1;      /* 总页数（重建时更新） */
+static int s_lib_last_page = -1;    /* 上次渲染的页码 */
 
 /*****************************************************************************
  * 函数名称：ui_pages_styles_init
@@ -331,6 +334,7 @@ static void ui_library_rebuild(void)
 {
     video_entry_t entries[UI_LIBRARY_MAX_ITEMS];
     char title_buf[64];
+    int total;
     int count;
     int i;
 
@@ -338,17 +342,35 @@ static void ui_library_rebuild(void)
         return;
     }
 
-    count = file_mgr_get_list(s_lib_ui->file_mgr, entries,
-                              UI_LIBRARY_MAX_ITEMS);
-    if (0 > count) {
+    /* 总文件数（分页计算基准） */
+    total = file_mgr_get_count(s_lib_ui->file_mgr);
+    if (0 > total) {
         return;
     }
 
-    /* 文件数未变化则跳过重建（每 5 分钟切段才变一次） */
-    if (count == s_lib_last_count) {
+    /* 页码越界修正：文件被清理后总页数减少，回退到最后一页 */
+    s_lib_page_max = (total + UI_LIBRARY_MAX_ITEMS - 1) /
+                     UI_LIBRARY_MAX_ITEMS;
+    if (0 == s_lib_page_max) {
+        s_lib_page_max = 1;
+    }
+    if (s_lib_page >= s_lib_page_max) {
+        s_lib_page = s_lib_page_max - 1;
+    }
+
+    /* 文件数与页码均未变化则跳过重建 */
+    if ((total == s_lib_last_count) && (s_lib_page == s_lib_last_page)) {
         return;
     }
-    s_lib_last_count = count;
+    s_lib_last_count = total;
+    s_lib_last_page = s_lib_page;
+
+    count = file_mgr_get_list(s_lib_ui->file_mgr, entries,
+                              UI_LIBRARY_MAX_ITEMS,
+                              s_lib_page * UI_LIBRARY_MAX_ITEMS);
+    if (0 > count) {
+        return;
+    }
 
     /* 释放旧行的动态内存（仅行卡片：以路径副本 user_data 识别，
      * 占位 label 无 user_data 直接跳过——lv_canvas_get_img 对
@@ -371,14 +393,34 @@ static void ui_library_rebuild(void)
     }
     lv_obj_clean(s_lib_list);
 
-    /* 重建列表 + 逐行请求缩略图 */
+    /* 重建当前页列表 + 逐行请求缩略图（幂等：已生成的自动跳过） */
     for (i = 0; i < count; i++) {
         ui_library_add_row(s_lib_list, &entries[i]);
         thumb_pipeline_request(entries[i].filepath);
     }
 
-    snprintf(title_buf, sizeof(title_buf), "录像文件库 (%d)", count);
+    snprintf(title_buf, sizeof(title_buf), "录像文件库 (%d) %d/%d",
+             total, s_lib_page + 1, s_lib_page_max);
     lv_label_set_text(s_lib_title, title_buf);
+}
+
+/*****************************************************************************
+ * 函数名称：lib_page_btn_cb
+ * 功能描述：翻页按钮回调（上页/下页），改页码后重建列表
+ * 输入参数：@e - 事件（user_data 存偏移量 +1 下页 / -1 上页）
+ *****************************************************************************/
+static void lib_page_btn_cb(lv_event_t* e)
+{
+    int delta = (int)(intptr_t)lv_event_get_user_data(e);
+
+    s_lib_page += delta;
+    if (0 > s_lib_page) {
+        s_lib_page = 0;
+    }
+    if (s_lib_page >= s_lib_page_max) {
+        s_lib_page = s_lib_page_max - 1;
+    }
+    ui_library_rebuild();
 }
 
 /*****************************************************************************
@@ -414,9 +456,36 @@ lv_obj_t* ui_page_library_create(ui_worker_t* ui)
     /* 内容区（右侧导航栏让位） */
     content = ui_page_content_create(page);
 
-    /* 顶栏（标题 label 保存供刷新文件数） */
+    /* 顶栏（标题 label 保存供刷新文件数/页码） */
     bar = ui_page_title_bar(content, "录像文件库");
     s_lib_title = lv_obj_get_child(bar, 0);
+
+    /* 翻页按钮（顶栏左右两端，符号字体渲染箭头） */
+    {
+        lv_obj_t* btn_prev = lv_btn_create(bar);
+        lv_obj_t* btn_next = lv_btn_create(bar);
+        lv_obj_t* lbl_prev = lv_label_create(btn_prev);
+        lv_obj_t* lbl_next = lv_label_create(btn_next);
+
+        lv_obj_set_size(btn_prev, 45, 45);
+        lv_obj_set_size(btn_next, 45, 45);
+        lv_obj_align(btn_prev, LV_ALIGN_LEFT_MID, 8, 0);
+        lv_obj_align(btn_next, LV_ALIGN_RIGHT_MID, -8, 0);
+        lv_obj_add_style(btn_prev, &s_style_trans, 0);
+        lv_obj_add_style(btn_next, &s_style_trans, 0);
+
+        lv_obj_center(lbl_prev);
+        lv_obj_center(lbl_next);
+        lv_obj_add_style(lbl_prev, &s_style_text_g, 0);
+        lv_obj_add_style(lbl_next, &s_style_text_g, 0);
+        lv_label_set_text(lbl_prev, LV_SYMBOL_LEFT);
+        lv_label_set_text(lbl_next, LV_SYMBOL_RIGHT);
+
+        lv_obj_add_event_cb(btn_prev, lib_page_btn_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)-1);
+        lv_obj_add_event_cb(btn_next, lib_page_btn_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)1);
+    }
 
     /* 滚动列表容器（顶栏下方） */
     s_lib_list = lv_obj_create(content);

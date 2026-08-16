@@ -544,26 +544,34 @@ int file_mgr_get_latest(file_mgr_t *mgr, char *path, size_t path_size)
 
 /*****************************************************************************
  * 函数名称：file_mgr_get_list
- * 功能描述：获取录像文件列表快照（最新在前，供 UI 文件库展示）
- * 输入参数：@mgr - 管理器指针
- *           @out - 输出数组（调用方分配，video_entry_t[max]）
- *           @max - 输出数组容量
- * 返回值：  拷贝的文件数（0 表示队列为空），失败返回 -1
+ * 功能描述：获取录像文件列表快照（最新在前，供 UI 文件库分页展示）
+ * 输入参数：@mgr    - 管理器指针
+ *           @out    - 输出数组（调用方分配，video_entry_t[max]）
+ *           @max    - 输出数组容量
+ *           @offset - 跳过最新 offset 个文件（分页：页码×页容量）
+ * 返回值：  拷贝的文件数（0 表示队列为空或 offset 越界），失败返回 -1
  * 注意事项：锁内快照拷贝，调用方拿到的是独立数据，无并发风险
  *****************************************************************************/
-int file_mgr_get_list(file_mgr_t *mgr, video_entry_t *out, int max)
+int file_mgr_get_list(file_mgr_t *mgr, video_entry_t *out, int max,
+                      int offset)
 {
     video_node_t *cur;
     int count = 0;
+    int skipped = 0;
 
-    if ((NULL == mgr) || (NULL == out) || (0 >= max)) {
+    if ((NULL == mgr) || (NULL == out) || (0 >= max) || (0 > offset)) {
         return -1;
     }
 
     pthread_mutex_lock(&mgr->mutex);
 
-    /* 从 tail（最新）向 head（最旧）遍历，最新文件排在前面 */
+    /* 从 tail（最新）向 head（最旧）遍历，最新文件排在前面：
+     * 先跳过 offset 个（上一页内容），再拷贝最多 max 个 */
     cur = mgr->tail;
+    while ((NULL != cur) && (skipped < offset)) {
+        skipped++;
+        cur = cur->prev;
+    }
     while ((NULL != cur) && (count < max)) {
         out[count++] = cur->entry;
         cur = cur->prev;

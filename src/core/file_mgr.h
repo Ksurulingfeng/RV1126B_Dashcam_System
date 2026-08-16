@@ -60,7 +60,8 @@ int  file_mgr_check(file_mgr_t *mgr);
 int  file_mgr_get_count(file_mgr_t *mgr);
 uint64_t file_mgr_get_used(file_mgr_t *mgr);
 int  file_mgr_get_latest(file_mgr_t *mgr, char *path, size_t path_size);
-int  file_mgr_get_list(file_mgr_t *mgr, video_entry_t *out, int max);
+int  file_mgr_get_list(file_mgr_t *mgr, video_entry_t *out, int max,
+                      int offset);
 void file_mgr_deinit(file_mgr_t *mgr);
 
 #ifdef __cplusplus

@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/stat.h>
@@ -86,8 +87,10 @@ static void* thumb_worker_thread(void* arg)
 {
     (void)arg;
 
-    /* 降优先级：缩略图是后台任务，不与录像编码/AI 推理抢 CPU */
-    nice(10);
+    /* 不降优先级：缩略图是用户交互任务（等着看），且生成是
+     * 秒级短任务；nice 降级在 UI 渲染高负载下会被饿死到分钟级
+     * （板端实测 nice(10) 时 2 分钟/张） */
+    nice(0);
 
     while (s_is_running) {
         char video_path[FILE_PATH_MAX];
@@ -110,10 +113,22 @@ static void* thumb_worker_thread(void* arg)
         s_req_count--;
         pthread_mutex_unlock(&s_req_mutex);
 
-        /* 生成缩略图（FFmpeg 解码抽帧，已在板端验证） */
+        /* 生成缩略图（FFmpeg 解码抽帧，计时诊断性能） */
         build_thumb_path(video_path, bmp_path);
-        ret = thumb_gen_from_video(video_path, bmp_path,
-                                   THUMB_PIPELINE_W, THUMB_H);
+        {
+            struct timespec t0;
+            struct timespec t1;
+            long ms;
+
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            ret = thumb_gen_from_video(video_path, bmp_path,
+                                       THUMB_PIPELINE_W, THUMB_H);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            ms = (t1.tv_sec - t0.tv_sec) * 1000 +
+                 (t1.tv_nsec - t0.tv_nsec) / 1000000;
+            LOG_I("THUMB", "生成耗时 %ldms ret=%d path=%s",
+                  ms, ret, video_path);
+        }
 
         /* 结果入完成队列（失败也入队，UI 显示占位） */
         memset(&done, 0, sizeof(done));
@@ -165,16 +180,26 @@ int thumb_pipeline_init(void)
 
 /*****************************************************************************
  * 函数名称：thumb_pipeline_request
- * 功能描述：请求生成指定录像文件的缩略图（异步，线程安全）
+ * 功能描述：请求生成指定录像文件的缩略图（异步，线程安全，幂等）
  * 输入参数：@video_path - 录像文件完整路径
- * 返回值：  入队成功0，队列满或参数无效-1
+ * 返回值：  入队成功0（缩略图已存在或已在队列也返回0），
+ *           队列满或参数无效-1
+ * 注意事项：UI 每次刷新列表会全量请求，已生成的直接跳过，
+ *           保证队列只处理真正缺失的缩略图
  *****************************************************************************/
 int thumb_pipeline_request(const char* video_path)
 {
+    char bmp_path[FILE_PATH_MAX];
     int ret = -1;
 
     if (NULL == video_path) {
         return -1;
+    }
+
+    /* 幂等：缩略图已生成则跳过，不占队列 */
+    build_thumb_path(video_path, bmp_path);
+    if (0 == access(bmp_path, F_OK)) {
+        return 0;
     }
 
     pthread_mutex_lock(&s_req_mutex);

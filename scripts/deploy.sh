@@ -118,7 +118,15 @@ stop_existing() {
     fi
     info "停止已有进程..."
     adb shell "killall ${BINARY_NAME}" 2>/dev/null || true
-    sleep 1
+
+    # 等旧进程完全退出（EOS 封口写 moov 需要时间），最多 10 秒。
+    # 不等就启动新程序会并发写同一批文件，产生打不开的坏段
+    for i in $(seq 1 20); do
+        if [[ -z "$(adb shell "pidof ${BINARY_NAME}" 2>/dev/null)" ]]; then
+            break
+        fi
+        sleep 0.5
+    done
     ok "已停止旧进程"
 }
 

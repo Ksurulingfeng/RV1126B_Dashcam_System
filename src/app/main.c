@@ -30,7 +30,7 @@
 #define FILE_ON 1
 #define GST_ON  1
 #define GPS_ON  1
-#define AI_ON   1
+#define AI_ON   0
 #define UI_ON   1
 
 /* 依赖校验：AI 帧源来自 GStreamer 预览分支，关 GST 必须关 AI，
@@ -55,10 +55,9 @@
 
 /* 录像存储（SD 卡，需已格式化为 exFAT 并挂载） */
 #define RECORD_DIR  "/mnt/sdcard/videos"
-/* 单文件目标时长 5 分钟；实际分段约 2 分钟——robust muxing 的
- * moov 每秒刷新会耗尽 muxer 预留表空间，splitmuxsink 为保文件
- * 完整会提前切段（板端实测，2 分钟粒度已接受） */
-#define SEGMENT_SEC 300
+/* 单文件 2 分钟：断电最多丢最后一段（2 分钟），粒度兼顾
+ * 循环覆盖与丢失容忍（行车记录仪行业常见 1~3 分钟） */
+#define SEGMENT_SEC 120
 #define MAX_STORAGE (28ULL * 1024 * 1024 * 1024) /* 28GB 上限（30G 卡留 2G 余量） */
 
 /* 系统退出标志（信号处理函数设置） */

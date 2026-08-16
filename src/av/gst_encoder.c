@@ -30,12 +30,7 @@
 /* splitmuxsink 文件命名模板缓冲大小 */
 #define LOCATION_BUF_SIZE 512
 
-/* 稳健复用参数：moov 索引每 1 秒刷新到磁盘，断电后文件
- * 保留最近一次索引，已录内容基本可播（robust muxing 官方方案） */
-#define MOOV_UPDATE_PERIOD_NS 1000000000ULL /* 1 秒（单位 ns） */
-
-/* EOS 封口等待上限（秒）：async-finalize 封口在后台线程执行，
- * SD 卡写入慢时可能超 2 秒，放宽到 5 秒纯防御（正常封口远快于此） */
+/* EOS 封口等待上限（秒），超时说明流水线卡死 */
 #define EOS_WAIT_SEC 5
 
 
@@ -78,21 +73,17 @@ static int get_next_file_index(const char *dir)
 
 /*****************************************************************************
  * 函数名称：setup_sink_props
- * 功能描述：配置 splitmuxsink 属性（稳健复用 muxer / 命名模板 /
- *           分段时长 / 序号接续）
+ * 功能描述：配置 splitmuxsink 属性（命名模板 / 分段时长 / 序号接续）
  * 输入参数：@sink   - splitmuxsink 元件
  *           @config - 编码配置
  * 返回值：  成功返回0，失败返回-1
- * 注意事项：稳健复用（robust muxing）让 mp4mux 周期性刷新 moov
- *           到磁盘，断电后文件保留最近一次索引，已录内容可播；
- *           采用 async-finalize + muxer-properties 路径：属性经
- *           GstStructure 传递，切段新建 muxer 会重新应用，
- *           旧文件在后台线程封口，切段不停顿
+ * 注意事项：默认 mp4mux 在 EOS/切段时写 moov 索引。robust muxing
+ *           方案已实测否决（1.24 下文件头刷新不写样本表，断电后
+ *           文件不可播），断电保护依赖优雅退出与短分段兜底
  *****************************************************************************/
 static int setup_sink_props(GstElement *sink,
                             const gst_encoder_config_t *config)
 {
-    GstStructure *muxer_props = NULL;
     char location[LOCATION_BUF_SIZE];
     int start_index;
 
@@ -102,23 +93,6 @@ static int setup_sink_props(GstElement *sink,
     g_object_set(G_OBJECT(sink), "max-size-time",
                  (guint64)config->segment_sec * GST_SECOND, NULL);
     g_object_set(G_OBJECT(sink), "start-index", start_index, NULL);
-
-    /* 稳健复用：moov 索引每 1 秒刷新到磁盘，断电后已录内容可播。
-     * reserved-moov-update-period 必须由应用显式设置非零才生效 */
-    muxer_props = gst_structure_new(
-        "properties",
-        "reserved-moov-update-period", G_TYPE_UINT64,
-        (guint64)MOOV_UPDATE_PERIOD_NS,
-        NULL);
-    if (NULL == muxer_props) {
-        return -1;
-    }
-    g_object_set(G_OBJECT(sink),
-                 "use-robust-muxing", TRUE,
-                 "async-finalize", TRUE,
-                 "muxer-properties", muxer_props,
-                 NULL);
-    gst_structure_free(muxer_props);
 
     return 0;
 }
@@ -196,7 +170,7 @@ static GstFlowReturn appsink_bgra_new_sample(GstAppSink *appsink,
  * 函数名称：create_record_pipeline
  * 功能描述：创建并组装分段录像流水线（tee 双分支：录像 + 预览）
  *           v4l2src → capsfilter → tee ─┬→ queue → mpph264enc → h264parse
- *                                      │     → splitmuxsink（稳健复用录像）
+ *                                      │     → splitmuxsink（分段录像）
  *                                      └→ queue → videoscale → appsink
  *                                            （预览，AI 推理同源）
  * 输入参数：@enc    - 编码器上下文（保存 pipeline/bus）
@@ -365,9 +339,9 @@ static int create_record_pipeline(gst_encoder_t *enc,
         goto error;
     }
 
-    /* splitmuxsink：稳健复用 muxer / 命名模板 / 分段时长 / 序号接续 */
+    /* splitmuxsink：命名模板 / 分段时长 / 序号接续 */
     if (0 != setup_sink_props(sink, config)) {
-        LOG_E("GST", "配置稳健复用 muxer 失败");
+        LOG_E("GST", "配置 splitmuxsink 失败");
         goto error;
     }
 
