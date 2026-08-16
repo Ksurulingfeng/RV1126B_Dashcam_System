@@ -302,20 +302,21 @@ static int scan_dir_entries(const char *path, uint32_t avg_bitrate,
 
 /*****************************************************************************
  * 函数名称：file_is_sealed
- * 功能描述：探测 MP4 是否已封口（文件末尾含合法 moov 索引）
+ * 功能描述：探测 MP4 是否已封口（头/尾窗口含合法 moov 索引）
  * 输入参数：@filepath - 文件完整路径
  * 返回值：  已封口返回 true；未封口（splitmuxsink 正在写）返回 false
- * 注意事项：只读文件末尾 MOOV_PROBE_SIZE 字节；从后往前找 moov
- *           魔数并校验 box 长度落在文件范围内，避免把 mdat 数据里
- *           偶然出现的 "moov" 字节误判为索引
+ * 注意事项：头尾各探测一次——qtmux 封口 moov 在文件尾，FFmpeg
+ *           崩溃恢复产物 moov 在文件头；校验 box 长度落在文件
+ *           范围内，避免把 mdat 数据里偶然出现的 "moov" 字节误判
  *****************************************************************************/
 static bool file_is_sealed(const char *filepath)
 {
     FILE *fp = NULL;
     uint8_t *buf = NULL;
     long file_size;
-    long probe_size;
-    long i;
+    long region_off;
+    long region_size;
+    int pass;
     bool sealed = false;
 
     fp = fopen(filepath, "rb");
@@ -330,37 +331,53 @@ static bool file_is_sealed(const char *filepath)
         goto done; /* 太小不可能有 moov */
     }
 
-    probe_size = (file_size < (long)MOOV_PROBE_SIZE) ?
-                 file_size : (long)MOOV_PROBE_SIZE;
-    buf = (uint8_t *)malloc((size_t)probe_size);
+    buf = (uint8_t *)malloc(MOOV_PROBE_SIZE);
     if (NULL == buf) {
         goto done;
     }
-    if (0 != fseek(fp, file_size - probe_size, SEEK_SET)) {
-        goto done;
-    }
-    if (probe_size != (long)fread(buf, 1, (size_t)probe_size, fp)) {
-        goto done;
-    }
 
-    /* 从后往前找 "moov" 魔数，box 头 4 字节是长度（大端）。
-     * 注意起点须为 probe_size-4：类型字段可出现在文件末尾
-     * 4 字节处（最小 8 字节 box 恰在窗口边缘） */
-    for (i = probe_size - 4; i >= 4; i--) {
-        uint32_t box_size;
-        long box_start;
+    /* 头尾两窗口：qtmux 封口 moov 在尾，FFmpeg 重建 moov 在头 */
+    for (pass = 0; pass < 2; pass++) {
+        long i;
 
-        if (0 == memcmp(buf + i, "moov", 4)) {
-            box_size = ((uint32_t)buf[i - 4] << 24) |
-                       ((uint32_t)buf[i - 3] << 16) |
-                       ((uint32_t)buf[i - 2] << 8) |
-                       (uint32_t)buf[i - 1];
-            box_start = file_size - probe_size + (i - 4);
-            /* 长度 ≥8 且 box 不超出文件范围才算合法索引 */
-            if ((8 <= box_size) &&
-                ((long)box_size <= file_size - box_start)) {
-                sealed = true;
+        if (0 == pass) {
+            region_off = 0;
+            region_size = (file_size < (long)MOOV_PROBE_SIZE) ?
+                          file_size : (long)MOOV_PROBE_SIZE;
+        } else {
+            region_off = file_size - (long)MOOV_PROBE_SIZE;
+            region_size = (long)MOOV_PROBE_SIZE;
+            if (0 > region_off) {
+                break; /* 小文件：头窗口已覆盖全文件 */
             }
+        }
+        if (0 != fseek(fp, region_off, SEEK_SET)) {
+            goto done;
+        }
+        if (region_size != (long)fread(buf, 1, (size_t)region_size, fp)) {
+            goto done;
+        }
+
+        /* 找 "moov" 魔数并校验 box 长度（长度字段在魔数前 4 字节） */
+        for (i = 4; i + 4 <= region_size; i++) {
+            uint32_t box_size;
+            long box_start;
+
+            if (0 == memcmp(buf + i, "moov", 4)) {
+                box_size = ((uint32_t)buf[i - 4] << 24) |
+                           ((uint32_t)buf[i - 3] << 16) |
+                           ((uint32_t)buf[i - 2] << 8) |
+                           (uint32_t)buf[i - 1];
+                box_start = region_off + (i - 4);
+                /* 长度 ≥8 且 box 不超出文件范围才算合法索引 */
+                if ((8 <= box_size) &&
+                    ((long)box_size <= file_size - box_start)) {
+                    sealed = true;
+                }
+                break;
+            }
+        }
+        if (sealed) {
             break;
         }
     }

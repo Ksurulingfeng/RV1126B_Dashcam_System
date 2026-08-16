@@ -7,7 +7,8 @@
 本项目以正点原子 ATK-DLRV1126B 开发板为硬件平台，实现了一台功能完整的智能行车记录仪：
 
 - **1080P 循环录像**：GStreamer 管线硬件编码（MPP），分段时长可设（默认 2 分钟），SD 卡满自动覆盖最旧录像
-- **断电保护**：短分段兜底 + SIGTERM EOS 优雅封口写 moov 索引，断电最多丢最后一段；文件库按 moov 封口探测自动隐藏未完成分段
+- **断电保护**：短分段兜底 + SIGTERM EOS 优雅封口写 moov 索引；文件库按 moov 封口探测自动隐藏未完成分段
+- **崩溃恢复**：启动时扫描断电残留，容错扫描 mdat 中 H264 流重建 moov（借用同目录完好文件解码配置），救回最后一段录像
 - **音视频双轨录像**：板载咪头 48kHz 单声道 AAC 录音，与视频同封装（mp4mux 音视频双轨 MP4）
 - **紧急锁定保护**：AI 检测到 person 连续 3 帧自动锁定当前分段（`_E` 后缀持久化），循环覆盖永不删除
 - **AI 目标检测**：YOLOv5s 部署于 3.0 TOPS NPU（RKNN INT8 量化），实测约 40fps，检测框实时绘制
@@ -97,7 +98,7 @@ GStreamer tee 预览分支(NV12 720p，与录像同源同视野)
 RV1126B_Dashcam_System/
 ├── src/
 │   ├── app/          # 程序入口（信号处理、模块组装、巡检循环）
-│   ├── av/           # 音视频（gst_encoder 分段录像 + thumb_gen FFmpeg 缩略图）
+│   ├── av/           # 音视频（gst_encoder 分段录像 + thumb_gen 缩略图 + video_recover 断电恢复）
 │   ├── core/         # 核心业务（file_mgr 目录守护：锁定/巡检删除）
 │   ├── gps/          # GPS（nmea_parser 解析 + gps_worker 线程）
 │   ├── common/       # 公共组件（thread_mgr + preview_share/detect_share 共享 + settings 配置 + log 日志）
@@ -156,6 +157,12 @@ printf 'AT+QGPS=1\r' > /dev/ttyUSB2
 gcc -std=c11 -Wall -I src/core -I src/common -o /tmp/test_file_mgr \
     src/core/file_mgr.c src/test/test_file_mgr.c -lpthread \
     && /tmp/test_file_mgr
+
+# video_recover（断电残留恢复，需真实坏文件）
+gcc -std=c11 -Wall -I src/av -I src/common -o /tmp/test_video_recover \
+    src/av/video_recover.c src/test/test_video_recover.c \
+    $(pkg-config --cflags --libs libavformat libavcodec libavutil) \
+    && /tmp/test_video_recover <断电残留.mp4>
 
 # nmea_parser（GGA/RMC 解析）
 gcc -std=c11 -Wall -I src/gps -o /tmp/test_nmea \

@@ -24,6 +24,7 @@
 #include "settings.h"
 #include "thread_mgr.h"
 #include "ui_main.h"
+#include "video_recover.h"
 
 /* 模块启用宏（调试开关，发布时全 1）
  * 依赖关系：AI 依赖 GST（GStreamer tee 预览分支喂帧）；
@@ -161,6 +162,10 @@ static int system_init(void)
         goto cleanup;
     }
     s_file_mgr_ready = true;
+    /* 断电残留恢复：须在编码器启动前执行——此时目录里未封口的
+     * 文件必是上次断电的残留（新的当前段尚未开始写入），
+     * 扫描 mdat 重建 moov 救回视频 */
+    video_recover_scan_dir(RECORD_DIR, CAMERA_FPS);
     LOG_I("MAIN", "已有 %d 个录像文件", file_mgr_get_count(&s_file_mgr));
 #endif
 
