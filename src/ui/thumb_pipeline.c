@@ -113,7 +113,7 @@ static void* thumb_worker_thread(void* arg)
         /* 生成缩略图（FFmpeg 解码抽帧，已在板端验证） */
         build_thumb_path(video_path, bmp_path);
         ret = thumb_gen_from_video(video_path, bmp_path,
-                                   THUMB_PIPELINE_W, THUMB_PIPELINE_H);
+                                   THUMB_PIPELINE_W, THUMB_H);
 
         /* 结果入完成队列（失败也入队，UI 显示占位） */
         memset(&done, 0, sizeof(done));

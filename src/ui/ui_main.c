@@ -38,6 +38,11 @@
 #define UI_NAV_BAR_W    160       /* 右侧导航栏宽度 */
 #define UI_NAV_BTN_H    88        /* 导航按钮高度 */
 
+/* 检测框标签（类别名 + 置信度，画在框顶） */
+#define UI_LABEL_H 20                  /* 标签高度（px） */
+#define UI_LABEL_TEXT_MAX \
+    (DETECT_NAME_MAX + 8)              /* "person 100%" + 结束符 */
+
 /* 界面控件 */
 static lv_obj_t* s_screen_live;
 static lv_obj_t* s_label_time;
@@ -105,8 +110,39 @@ static void ui_status_tick(lv_timer_t* timer)
 }
 
 /*****************************************************************************
+ * 函数名称：ui_draw_box_label
+ * 功能描述：在检测框顶部绘制标签（深色底 + 白字"类别 置信度%"）
+ * 输入参数：@left/@top - 检测框左上角
+ *           @width     - 检测框宽度
+ *           @name      - 类别名（如 "person"）
+ *           @conf      - 置信度（0~100）
+ * 注意事项：框太靠顶时标签改画框内，防止超出 canvas 边界
+ *****************************************************************************/
+static void ui_draw_box_label(int left, int top, int width,
+                              const char* name, int conf)
+{
+    char label[UI_LABEL_TEXT_MAX];
+    lv_draw_rect_dsc_t bg_dsc;
+    lv_draw_label_dsc_t label_dsc;
+    int label_y = (UI_LABEL_H <= top) ? (top - UI_LABEL_H) : top;
+
+    /* 标签底色（半透明深灰） */
+    lv_draw_rect_dsc_init(&bg_dsc);
+    bg_dsc.bg_color = lv_color_make(0x20, 0x20, 0x20);
+    bg_dsc.bg_opa = LV_OPA_70;
+    lv_canvas_draw_rect(s_canvas, left, label_y, width, UI_LABEL_H, &bg_dsc);
+
+    /* 标签文字（白色，超长由 max_width 截断） */
+    lv_draw_label_dsc_init(&label_dsc);
+    label_dsc.color = lv_color_white();
+    snprintf(label, sizeof(label), "%s %d%%", name, conf);
+    lv_canvas_draw_text(s_canvas, left + 4, label_y + 2, width,
+                        &label_dsc, label);
+}
+
+/*****************************************************************************
  * 函数名称：ui_draw_detect_boxes
- * 功能描述：在 canvas 上绘制检测框（绿色描边矩形）
+ * 功能描述：在 canvas 上绘制检测框（绿色描边 + 类别标签）
  * 输入参数：@boxes - 检测框数组
  *           @count - 框数量
  *****************************************************************************/
@@ -126,6 +162,9 @@ static void ui_draw_detect_boxes(const detect_box_t* boxes, uint32_t count)
                             boxes[i].right - boxes[i].left,
                             boxes[i].bottom - boxes[i].top,
                             &dsc);
+        ui_draw_box_label(boxes[i].left, boxes[i].top,
+                          boxes[i].right - boxes[i].left,
+                          boxes[i].name, boxes[i].conf);
     }
 }
 

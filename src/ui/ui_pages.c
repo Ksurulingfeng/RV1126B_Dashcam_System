@@ -171,7 +171,7 @@ static bool bmp_load_to_canvas(lv_color_t* buf, const char* bmp_path)
     if (0 > height) {
         height = -height; /* 自顶向下存储 */
     }
-    if ((THUMB_PIPELINE_W != width) || (THUMB_PIPELINE_H != height)) {
+    if ((THUMB_PIPELINE_W != width) || (THUMB_H != height)) {
         goto done;
     }
 
@@ -232,12 +232,12 @@ static void ui_library_add_row(lv_obj_t* parent, const video_entry_t* entry)
     /* 缩略图 canvas（160×90 左侧，生成前显示占位灰） */
     thumb = lv_canvas_create(row);
     thumb_buf = (lv_color_t*)malloc(sizeof(lv_color_t) *
-                                    THUMB_PIPELINE_W * THUMB_PIPELINE_H);
+                                    THUMB_PIPELINE_W * THUMB_H);
     if (NULL != thumb_buf) {
         memset(thumb_buf, 0x20, sizeof(lv_color_t) *
-               THUMB_PIPELINE_W * THUMB_PIPELINE_H);
+               THUMB_PIPELINE_W * THUMB_H);
         lv_canvas_set_buffer(thumb, thumb_buf, THUMB_PIPELINE_W,
-                             THUMB_PIPELINE_H, LV_IMG_CF_TRUE_COLOR);
+                             THUMB_H, LV_IMG_CF_TRUE_COLOR);
     }
     lv_obj_align(thumb, LV_ALIGN_LEFT_MID, 16, 0);
     lv_obj_set_style_radius(thumb, 8, 0);

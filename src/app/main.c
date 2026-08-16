@@ -55,7 +55,10 @@
 
 /* 录像存储（SD 卡，需已格式化为 exFAT 并挂载） */
 #define RECORD_DIR  "/mnt/sdcard/videos"
-#define SEGMENT_SEC 300                          /* 单文件 5 分钟 */
+/* 单文件目标时长 5 分钟；实际分段约 2 分钟——robust muxing 的
+ * moov 每秒刷新会耗尽 muxer 预留表空间，splitmuxsink 为保文件
+ * 完整会提前切段（板端实测，2 分钟粒度已接受） */
+#define SEGMENT_SEC 300
 #define MAX_STORAGE (28ULL * 1024 * 1024 * 1024) /* 28GB 上限（30G 卡留 2G 余量） */
 
 /* 系统退出标志（信号处理函数设置） */
@@ -91,7 +94,7 @@ static gps_worker_t s_gps_worker;
 static ai_worker_t s_ai_worker;
 static ui_worker_t s_ui_worker;
 static thread_mgr_t s_thread_mgr;
-static detect_share_t s_detect_share;   /* AI → UI 检测结果 */
+static detect_share_t s_detect_share;        /* AI → UI 检测结果 */
 static preview_share_t s_preview_share;      /* GStreamer → AI（NV12） */
 static preview_share_t s_preview_bgra_share; /* GStreamer → UI（BGRA） */
 
@@ -140,7 +143,7 @@ static int system_init(void)
     int ret = -1;
 
     /* 跨线程共享数据 */
-    detect_share_init(&s_detect_share);   /* 检测结果共享（AI → UI） */
+    detect_share_init(&s_detect_share); /* 检测结果共享（AI → UI） */
     preview_share_init(&s_preview_share, PREVIEW_NV12_SIZE);
     preview_share_init(&s_preview_bgra_share, PREVIEW_BGRA_SIZE);
 

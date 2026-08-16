@@ -131,6 +131,7 @@ static void loop_push_detect(ai_loop_ctx_t* lc,
         boxes[i].bottom          = r->box.bottom;
         strncpy(boxes[i].name, r->name, DETECT_NAME_MAX - 1);
         boxes[i].name[DETECT_NAME_MAX - 1] = '\0';
+        boxes[i].conf = (int)(r->prop * 100);
     }
 
     if (0 < n) {

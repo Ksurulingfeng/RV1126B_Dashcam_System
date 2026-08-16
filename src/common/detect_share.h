@@ -27,6 +27,7 @@ typedef struct {
     int  right;
     int  bottom;
     char name[DETECT_NAME_MAX];
+    int  conf; /* 置信度（0~100 百分数，AI 侧 prop×100 取整） */
 } detect_box_t;
 
 /* 检测结果共享缓冲 */

@@ -434,12 +434,15 @@ int file_mgr_lock_file(file_mgr_t *mgr, const char *filepath)
  * 输入参数：@mgr       - 管理器指针
  *           @path      - 输出：锁定后的文件路径
  *           @path_size - 输出缓冲大小
- * 返回值：  成功返回0（已锁定文件返回路径也视为成功），失败返回-1
- * 注意事项：供 AI 紧急锁定联动使用——队列为空（启动初期尚未
- *           巡检到分段）时返回失败，调用方下帧重试即可
+ * 返回值：  成功返回0，失败返回-1
+ * 注意事项：供 AI 紧急锁定联动使用。从队列尾部向前跳过已锁定
+ *           文件（tail 可能是启动初期残留的旧 _E 分段），锁定
+ *           真正的新分段；全部已锁定或队列为空时返回失败，
+ *           调用方下帧重试即可
  *****************************************************************************/
 int file_mgr_lock_latest(file_mgr_t *mgr, char *path, size_t path_size)
 {
+    video_node_t *cur = NULL;
     int ret = -1;
 
     if ((NULL == mgr) || (NULL == path) || (0 == path_size)) {
@@ -448,13 +451,16 @@ int file_mgr_lock_latest(file_mgr_t *mgr, char *path, size_t path_size)
 
     pthread_mutex_lock(&mgr->mutex);
 
-    if (NULL != mgr->tail) {
-        /* 原子完成：锁定 + 取路径（两步在锁内，队列不会中途变化） */
-        if (0 == node_lock(mgr, mgr->tail)) {
-            strncpy(path, mgr->tail->entry.filepath, path_size - 1);
-            path[path_size - 1] = '\0';
-            ret = 0;
-        }
+    /* 跳过 tail 方向连续已锁定文件（启动初期残留的旧 _E 分段），
+     * 停在第一个未锁定节点——原子完成锁定 + 取路径 */
+    cur = mgr->tail;
+    while ((NULL != cur) && (cur->entry.is_locked)) {
+        cur = cur->prev;
+    }
+    if ((NULL != cur) && (0 == node_lock(mgr, cur))) {
+        strncpy(path, cur->entry.filepath, path_size - 1);
+        path[path_size - 1] = '\0';
+        ret = 0;
     }
 
     pthread_mutex_unlock(&mgr->mutex);

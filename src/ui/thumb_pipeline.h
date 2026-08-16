@@ -16,7 +16,7 @@
 
 /* 缩略图默认尺寸（16:9，与卡片显示尺寸一致，避免二次缩放） */
 #define THUMB_PIPELINE_W 160
-#define THUMB_PIPELINE_H 90
+#define THUMB_H 90
 
 /* 缩略图输出目录（内存文件系统，重启自动清理与录像列表同步） */
 #define THUMB_PIPELINE_DIR "/tmp/thumbs"
