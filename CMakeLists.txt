@@ -27,6 +27,8 @@ pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.c" "src/*.cc")
 # 测试代码双重排除：test 目录全部 + 散落各处的 *_test.c/cc
 list(FILTER SOURCES EXCLUDE REGEX ".*/test/.*")
+# 参考资料目录（lv_drivers 源码，RGA 专项备用）不参与编译
+list(FILTER SOURCES EXCLUDE REGEX ".*/third_party/.*")
 list(FILTER SOURCES EXCLUDE REGEX ".*_test\\.(c|cc)$")
 
 set(OPENCV_LIBS opencv_core opencv_videoio opencv_video opencv_highgui opencv_imgcodecs opencv_imgproc)
@@ -35,7 +37,6 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/src/ui
-    ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/app
     ${CMAKE_SOURCE_DIR}/src/core
     ${CMAKE_SOURCE_DIR}/src/common
@@ -44,6 +45,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/src/av
     ${CMAKE_SOURCE_DIR}/src/network
     ${CMAKE_SOURCE_DIR}/src/test
+    ${CMAKE_SOURCE_DIR}/src/third_party/lv_drivers/display
     ${GST_INCLUDE_DIRS}
     ${FFMPEG_INCLUDE_DIRS}
     ${TOOLCHAIN_DIR}/aarch64-buildroot-linux-gnu/sysroot/usr/include/rknn

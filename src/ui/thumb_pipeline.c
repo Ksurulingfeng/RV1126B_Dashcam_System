@@ -56,12 +56,14 @@ static bool queue_already_requested(const char* video_path)
 }
 
 /*****************************************************************************
- * 函数名称：build_thumb_path
+ * 函数名称：thumb_pipeline_bmp_path
  * 功能描述：由录像路径构造缩略图 BMP 路径（/tmp/thumbs/文件名.bmp）
  * 输入参数：@video_path - 录像路径
  * 输出参数：@bmp_path   - 输出路径缓冲（FILE_PATH_MAX）
+ * 注意事项：公开给 UI——行创建时同步检查 BMP 是否已生成并直接
+ *           加载（完成队列是内存态，重启后磁盘有 BMP 但队列空）
  *****************************************************************************/
-static void build_thumb_path(const char* video_path, char* bmp_path)
+void thumb_pipeline_bmp_path(const char* video_path, char* bmp_path)
 {
     const char* slash = strrchr(video_path, '/');
     const char* name = (NULL == slash) ? video_path : slash + 1;
@@ -114,7 +116,7 @@ static void* thumb_worker_thread(void* arg)
         pthread_mutex_unlock(&s_req_mutex);
 
         /* 生成缩略图（FFmpeg 解码抽帧，计时诊断性能） */
-        build_thumb_path(video_path, bmp_path);
+        thumb_pipeline_bmp_path(video_path, bmp_path);
         {
             struct timespec t0;
             struct timespec t1;
@@ -197,7 +199,7 @@ int thumb_pipeline_request(const char* video_path)
     }
 
     /* 幂等：缩略图已生成则跳过，不占队列 */
-    build_thumb_path(video_path, bmp_path);
+    thumb_pipeline_bmp_path(video_path, bmp_path);
     if (0 == access(bmp_path, F_OK)) {
         return 0;
     }

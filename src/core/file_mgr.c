@@ -226,10 +226,11 @@ static int node_lock(file_mgr_t *mgr, video_node_t *node)
 
 /* =========================================================================
  * 内部辅助：锁外扫描目录，收集 .mp4 文件元数据到动态数组
- * 注意事项：不触碰队列，可在任意线程调用；调用者负责 free 返回数组
+ * 注意事项：不触碰队列，可在任意线程调用；调用者负责 free 返回数组；
+ *           时长按 CBR 码率估算（size×8÷bitrate），精度约 ±2%
  * ========================================================================= */
-static int scan_dir_entries(const char *path, video_entry_t **out_entries,
-                            int *out_count)
+static int scan_dir_entries(const char *path, uint32_t avg_bitrate,
+                            video_entry_t **out_entries, int *out_count)
 {
     DIR *dir = NULL;
     struct dirent *entry = NULL;
@@ -273,6 +274,8 @@ static int scan_dir_entries(const char *path, video_entry_t **out_entries,
                 ve.size      = (uint64_t)file_stat.st_size;
                 ve.timestamp = file_stat.st_mtime;
                 ve.is_locked = name_is_emergency(entry->d_name);
+                ve.duration_sec = (uint32_t)(ve.size * 8 /
+                                             avg_bitrate);
                 entries[count++] = ve;
             }
         }
@@ -313,13 +316,14 @@ static void queue_rebuild(file_mgr_t *mgr, video_entry_t *entries, int count)
  * 返回值：  成功返回0，失败返回-1
  * 注意事项：启动时调用一次，会自动恢复上次的紧急文件锁定状态
  *****************************************************************************/
-int file_mgr_init(file_mgr_t *mgr, const char *path, uint64_t max_size)
+int file_mgr_init(file_mgr_t *mgr, const char *path, uint64_t max_size,
+                  uint32_t avg_bitrate)
 {
     struct stat st;
     video_entry_t *entries = NULL;
     int count = 0;
 
-    if ((NULL == mgr) || (NULL == path)) {
+    if ((NULL == mgr) || (NULL == path) || (0 == avg_bitrate)) {
         return -1;
     }
 
@@ -335,9 +339,10 @@ int file_mgr_init(file_mgr_t *mgr, const char *path, uint64_t max_size)
     pthread_mutex_init(&mgr->mutex, NULL);
     strncpy(mgr->storage_path, path, sizeof(mgr->storage_path) - 1);
     mgr->max_total_size = max_size;
+    mgr->avg_bitrate = avg_bitrate;
 
     /* 锁外扫描 + 锁内重建队列；失败时销毁锁保持资源配对 */
-    if (0 != scan_dir_entries(path, &entries, &count)) {
+    if (0 != scan_dir_entries(path, avg_bitrate, &entries, &count)) {
         pthread_mutex_destroy(&mgr->mutex);
         memset(mgr, 0, sizeof(file_mgr_t));
         return -1;
@@ -545,15 +550,17 @@ int file_mgr_get_latest(file_mgr_t *mgr, char *path, size_t path_size)
 /*****************************************************************************
  * 函数名称：file_mgr_get_list
  * 功能描述：获取录像文件列表快照（最新在前，供 UI 文件库分页展示）
- * 输入参数：@mgr    - 管理器指针
- *           @out    - 输出数组（调用方分配，video_entry_t[max]）
- *           @max    - 输出数组容量
- *           @offset - 跳过最新 offset 个文件（分页：页码×页容量）
+ * 输入参数：@mgr       - 管理器指针
+ *           @out       - 输出数组（调用方分配，video_entry_t[max]）
+ *           @max       - 输出数组容量
+ *           @offset    - 跳过最新 offset 个文件（分页：页码×页容量）
+ *           @skip_tail - 跳过 tail 节点（通常是正在写入的分段，
+ *                        未封口无 moov，不应出现在文件库列表）
  * 返回值：  拷贝的文件数（0 表示队列为空或 offset 越界），失败返回 -1
  * 注意事项：锁内快照拷贝，调用方拿到的是独立数据，无并发风险
  *****************************************************************************/
 int file_mgr_get_list(file_mgr_t *mgr, video_entry_t *out, int max,
-                      int offset)
+                      int offset, bool skip_tail)
 {
     video_node_t *cur;
     int count = 0;
@@ -566,8 +573,12 @@ int file_mgr_get_list(file_mgr_t *mgr, video_entry_t *out, int max,
     pthread_mutex_lock(&mgr->mutex);
 
     /* 从 tail（最新）向 head（最旧）遍历，最新文件排在前面：
-     * 先跳过 offset 个（上一页内容），再拷贝最多 max 个 */
+     * 先跳过正在写的分段与 offset 个（上一页内容），
+     * 再拷贝最多 max 个 */
     cur = mgr->tail;
+    if (skip_tail && (NULL != cur)) {
+        cur = cur->prev;
+    }
     while ((NULL != cur) && (skipped < offset)) {
         skipped++;
         cur = cur->prev;
@@ -601,7 +612,8 @@ int file_mgr_check(file_mgr_t *mgr)
     }
 
     /* 锁外扫描目录：磁盘 I/O 不阻塞 AI 锁定与 UI 查询 */
-    if (0 != scan_dir_entries(mgr->storage_path, &entries, &count)) {
+    if (0 != scan_dir_entries(mgr->storage_path, mgr->avg_bitrate,
+                              &entries, &count)) {
         LOG_E("FILE", "扫描目录失败（SD 卡异常？）");
         return -1;
     }

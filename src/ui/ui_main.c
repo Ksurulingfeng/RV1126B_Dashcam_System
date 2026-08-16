@@ -65,11 +65,6 @@ static uint32_t s_ui_frame_id = 0;
 /* freetype 字体实例 */
 static lv_ft_info_t s_ft_info;
 
-/* 页面栈（返回键用，最多 4 级） */
-#define UI_PAGE_STACK_MAX 4
-static lv_obj_t* s_page_stack[UI_PAGE_STACK_MAX];
-static int s_page_stack_top = -1;
-
 /*****************************************************************************
  * 函数名称：ui_status_tick
  * 功能描述：每秒刷新状态栏（时间/GPS/存储）
@@ -212,57 +207,17 @@ static void rec_breath_exec(void* obj, int32_t opa)
 }
 
 /*****************************************************************************
- * 函数名称：ui_page_push
- * 功能描述：页面栈压入（导航跳转前记录当前页）
- * 输入参数：@page - 当前页面
- *****************************************************************************/
-static void ui_page_push(lv_obj_t* page)
-{
-    if (s_page_stack_top < UI_PAGE_STACK_MAX - 1) {
-        s_page_stack_top++;
-        s_page_stack[s_page_stack_top] = page;
-    }
-}
-
-/*****************************************************************************
- * 函数名称：ui_page_pop
- * 功能描述：页面栈弹出（返回键用）
- * 返回值：  上一页面，栈空返回 NULL
- *****************************************************************************/
-static lv_obj_t* ui_page_pop(void)
-{
-    lv_obj_t* page = NULL;
-
-    if (0 <= s_page_stack_top) {
-        page = s_page_stack[s_page_stack_top];
-        s_page_stack_top--;
-    }
-    return page;
-}
-
-/*****************************************************************************
  * 函数名称：ui_nav_to
- * 功能描述：跳转页面（记录当前页到栈，带动画加载目标页）
+ * 功能描述：跳转页面（平级导航，无返回栈；带动画加载目标页）
  * 输入参数：@target - 目标页面
+ * 注意事项：目标页已是当前页时跳过（防重复加载动画闪烁）
  *****************************************************************************/
 static void ui_nav_to(lv_obj_t* target)
 {
-    ui_page_push(lv_scr_act());
-    lv_scr_load_anim(target, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
-}
-
-/*****************************************************************************
- * 函数名称：ui_nav_back
- * 功能描述：返回上一页（栈空时停留主页，防止空指针加载崩溃）
- *****************************************************************************/
-static void ui_nav_back(void)
-{
-    lv_obj_t* prev = ui_page_pop();
-
-    if (NULL == prev) {
-        prev = s_screen_live; /* 栈空：已在主页，返回键保持主页 */
+    if (target == lv_scr_act()) {
+        return;
     }
-    lv_scr_load_anim(prev, LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0, false);
+    lv_scr_load_anim(target, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
 }
 
 /*****************************************************************************
@@ -297,13 +252,12 @@ static void ui_nav_event_cb(lv_event_t* e)
             }
             ui_nav_to(s_screen_settings);
             break;
-        case 2: /* 主页 */
-            lv_scr_load_anim(s_screen_live, LV_SCR_LOAD_ANIM_MOVE_RIGHT,
-                             200, 0, false);
-            s_page_stack_top = -1; /* 回主页清空栈 */
-            break;
-        case 3: /* 返回 */
-            ui_nav_back();
+        case 2: /* 主页（平级直达，无返回栈） */
+            if (s_screen_live != lv_scr_act()) {
+                lv_scr_load_anim(s_screen_live,
+                                 LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0,
+                                 false);
+            }
             break;
         default:
             break;
@@ -413,13 +367,13 @@ static void ui_create_status_bar(lv_obj_t* parent)
  *****************************************************************************/
 void ui_nav_bar_create(lv_obj_t* parent, ui_worker_t* ui)
 {
-    static const char* const nav_texts[] = {"录像", "设置", "主页", "返回"};
+    static const char* const nav_texts[] = {"录像", "设置", "主页"};
     lv_obj_t* bar = lv_obj_create(parent);
     lv_obj_t* btn;
     lv_obj_t* label;
     int i;
 
-    /* 右侧导航栏：竖排 4 键，顶部与状态栏对齐 */
+    /* 右侧导航栏：竖排 3 键（平级导航，无返回键） */
     lv_obj_set_size(bar, UI_NAV_BAR_W, lv_pct(100));
     lv_obj_align(bar, LV_ALIGN_TOP_RIGHT, 0, 0);
     lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
@@ -431,8 +385,8 @@ void ui_nav_bar_create(lv_obj_t* parent, ui_worker_t* ui)
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 4 个导航按钮（卡片灰底白字） */
-    for (i = 0; i < 4; i++) {
+    /* 3 个导航按钮（卡片灰底白字） */
+    for (i = 0; i < 3; i++) {
         btn = lv_btn_create(bar);
         lv_obj_set_size(btn, UI_NAV_BAR_W - 32, UI_NAV_BTN_H);
         lv_obj_set_style_bg_color(btn, lv_color_hex(UI_COLOR_CARD), 0);

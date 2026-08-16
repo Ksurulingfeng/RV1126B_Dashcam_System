@@ -72,7 +72,12 @@ static int settings_load_file(void)
         unsigned int sec = 0;
 
         if (2 == sscanf(line, "%31[^=]=%31s", key, value)) {
-            if (0 == strcmp(key, "ai_draw_box")) {
+            if (0 == strcmp(key, "ai_enabled")) {
+                if (parse_bool(value, &bool_val)) {
+                    s_settings.ai_enabled = bool_val;
+                    loaded++;
+                }
+            } else if (0 == strcmp(key, "ai_draw_box")) {
                 if (parse_bool(value, &bool_val)) {
                     s_settings.ai_draw_box = bool_val;
                     loaded++;
@@ -141,6 +146,7 @@ int settings_init(const char *conf_path)
     pthread_mutex_lock(&s_mutex);
 
     /* 默认值先行，加载覆盖 */
+    s_settings.ai_enabled    = true;
     s_settings.ai_draw_box   = true;
     s_settings.ai_auto_lock  = true;
     s_settings.record_enabled = true;
@@ -177,6 +183,7 @@ int settings_save(void)
         ret = -1;
     } else {
         fprintf(fp, "# 行车记录仪设置（自动生成，可手改）\n");
+        fprintf(fp, "ai_enabled=%d\n", s_settings.ai_enabled ? 1 : 0);
         fprintf(fp, "ai_draw_box=%d\n", s_settings.ai_draw_box ? 1 : 0);
         fprintf(fp, "ai_auto_lock=%d\n", s_settings.ai_auto_lock ? 1 : 0);
         fprintf(fp, "record_enabled=%d\n",
@@ -188,6 +195,35 @@ int settings_save(void)
 
     pthread_mutex_unlock(&s_mutex);
     return ret;
+}
+
+
+/*****************************************************************************
+ * 函数名称：settings_get_ai_enabled
+ * 功能描述：读取 AI 识别总开关
+ * 返回值：  开启返回 true
+ *****************************************************************************/
+bool settings_get_ai_enabled(void)
+{
+    bool on;
+
+    pthread_mutex_lock(&s_mutex);
+    on = s_settings.ai_enabled;
+    pthread_mutex_unlock(&s_mutex);
+    return on;
+}
+
+
+/*****************************************************************************
+ * 函数名称：settings_set_ai_enabled
+ * 功能描述：设置 AI 识别总开关
+ * 输入参数：@on - 是否开启
+ *****************************************************************************/
+void settings_set_ai_enabled(bool on)
+{
+    pthread_mutex_lock(&s_mutex);
+    s_settings.ai_enabled = on;
+    pthread_mutex_unlock(&s_mutex);
 }
 
 

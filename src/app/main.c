@@ -31,7 +31,7 @@
 #define FILE_ON 1
 #define GST_ON  1
 #define GPS_ON  1
-#define AI_ON   0
+#define AI_ON   1
 #define UI_ON   1
 
 /* 依赖校验：AI 帧源来自 GStreamer 预览分支，关 GST 必须关 AI，

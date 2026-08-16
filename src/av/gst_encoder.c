@@ -33,7 +33,6 @@
 /* EOS 封口等待上限（秒），超时说明流水线卡死 */
 #define EOS_WAIT_SEC 5
 
-
 /*****************************************************************************
  * 函数名称：get_next_file_index
  * 功能描述：扫描目录找最大录像序号 +1，重启后新录像不会覆盖旧文件
@@ -321,9 +320,12 @@ static int create_record_pipeline(gst_encoder_t *enc,
     gst_app_sink_set_callbacks(GST_APP_SINK(appsink_bgra), &cb, enc, NULL);
 
     /* 组装：先 add（bin 接管元件所有权），后 link tee 多分支
-     * 录像路：tee → valve → queue → encoder → parser → splitmuxsink
+     * 录像路：tee → queue → encoder → valve → parser → splitmuxsink
      * 预览路：tee → queue → scale → tee2 ─→ queue → appsink(NV12→AI)
-     *                                   └→ queue → videoconvert → appsink(BGRA→UI) */
+     *                                   └→ queue → videoconvert → appsink(BGRA→UI)
+     * 注：valve 必须在编码器之后——断在编码器前会让 mpp 长时间
+     * 无输入状态错乱，恢复时输出时间戳异常触发异常切段（0 字节
+     * 空文件）；断在编码后则编码器持续运转、恢复无缝续写 */
     gst_bin_add_many(GST_BIN(pipeline), src, capsfilter, tee,
                      record_valve, queue_rec, queue_prev, scale, tee2,
                      queue_nv12, queue_bgra, videoconvert,
@@ -331,8 +333,8 @@ static int create_record_pipeline(gst_encoder_t *enc,
                      encoder, parser, sink, NULL);
     if ((FALSE == gst_element_link(src, capsfilter)) ||
         (FALSE == gst_element_link(capsfilter, tee)) ||
-        (FALSE == gst_element_link_many(tee, record_valve, queue_rec,
-                                        encoder, parser, sink, NULL)) ||
+        (FALSE == gst_element_link_many(tee, queue_rec, encoder,
+                                        record_valve, parser, sink, NULL)) ||
         (FALSE == gst_element_link_many(tee, queue_prev, scale,
                                         tee2, NULL)) ||
         (FALSE == gst_element_link_many(tee2, queue_nv12,
@@ -353,6 +355,7 @@ static int create_record_pipeline(gst_encoder_t *enc,
         LOG_E("GST", "配置 splitmuxsink 失败");
         goto error;
     }
+
 
     /* 保存上下文 */
     enc->pipeline = pipeline;

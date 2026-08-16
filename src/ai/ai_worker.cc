@@ -499,6 +499,12 @@ static void inference_loop(ai_worker_t* worker, rknn_context ctx,
         memset(&result_group, 0, sizeof(result_group));
         infer_ms = 0.0;
 
+        /* AI 总开关关闭：空转休眠，跳过推理与推结果（省 CPU/NPU） */
+        if (!settings_get_ai_enabled()) {
+            usleep(AI_IDLE_WAIT_US);
+            goto next_frame;
+        }
+
         /* ① 取帧 + 画框 + 推 UI（无新帧则休眠等待，防忙等烧 CPU） */
         if (!loop_capture_show(&lc, frame)) {
             usleep(AI_IDLE_WAIT_US);

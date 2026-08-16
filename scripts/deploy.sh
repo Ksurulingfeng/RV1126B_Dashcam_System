@@ -117,7 +117,7 @@ stop_existing() {
         return 0
     fi
     info "停止已有进程..."
-    adb shell "killall ${BINARY_NAME}" 2>/dev/null || true
+    adb shell "killall -TERM ${BINARY_NAME}" 2>/dev/null || true
 
     # 等旧进程完全退出（EOS 封口写 moov 需要时间），最多 10 秒。
     # 不等就启动新程序会并发写同一批文件，产生打不开的坏段

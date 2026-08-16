@@ -28,6 +28,7 @@ typedef struct {
     uint64_t size;
     time_t   timestamp;
     bool     is_locked;
+    uint32_t duration_sec; /* 估算时长（秒），size×8÷平均码率 */
 } video_entry_t;
 
 /* 双向链表节点 */
@@ -44,6 +45,7 @@ typedef struct {
     uint64_t        max_total_size;    /* 总容量（字节） */
     uint64_t        current_used;      /* 当前已用空间（字节） */
     uint32_t        entry_count;       /* 队列中文件数 */
+    uint32_t        avg_bitrate;       /* 平均码率（bps），时长估算用 */
     video_node_t   *head;              /* 最旧文件 */
     video_node_t   *tail;              /* 最新文件（正在写入的分段） */
 } file_mgr_t;
@@ -52,7 +54,8 @@ typedef struct {
 extern "C" {
 #endif
 
-int  file_mgr_init(file_mgr_t *mgr, const char *path, uint64_t max_size);
+int  file_mgr_init(file_mgr_t *mgr, const char *path, uint64_t max_size,
+                   uint32_t avg_bitrate);
 int  file_mgr_evict(file_mgr_t *mgr, uint64_t size_needed);
 int  file_mgr_lock_file(file_mgr_t *mgr, const char *filepath);
 int  file_mgr_lock_latest(file_mgr_t *mgr, char *path, size_t path_size);
@@ -61,7 +64,7 @@ int  file_mgr_get_count(file_mgr_t *mgr);
 uint64_t file_mgr_get_used(file_mgr_t *mgr);
 int  file_mgr_get_latest(file_mgr_t *mgr, char *path, size_t path_size);
 int  file_mgr_get_list(file_mgr_t *mgr, video_entry_t *out, int max,
-                      int offset);
+                      int offset, bool skip_tail);
 void file_mgr_deinit(file_mgr_t *mgr);
 
 #ifdef __cplusplus

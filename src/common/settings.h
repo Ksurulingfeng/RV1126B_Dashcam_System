@@ -15,6 +15,7 @@
 
 /* 设置项（读写接口内部加锁，任意线程安全） */
 typedef struct {
+    bool     ai_enabled;     /* AI 识别总开关（关闭跳过推理省 CPU） */
     bool     ai_draw_box;    /* AI 检测框绘制开关 */
     bool     ai_auto_lock;   /* person 紧急自动锁定开关 */
     bool     record_enabled; /* 录像开关（GStreamer valve 控制） */
@@ -43,6 +44,8 @@ int settings_init(const char *conf_path);
 int settings_save(void);
 
 /* 以下为各设置项的线程安全读写接口 */
+bool settings_get_ai_enabled(void);
+void settings_set_ai_enabled(bool on);
 bool settings_get_ai_draw_box(void);
 void settings_set_ai_draw_box(bool on);
 bool settings_get_ai_auto_lock(void);

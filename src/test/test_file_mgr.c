@@ -46,7 +46,7 @@ int main(void)
 
     /* 场景1：初始化（空目录） */
     printf("===== 场景1: 初始化 =====\n");
-    if (0 != file_mgr_init(&mgr, TEST_DIR, TEST_MAX)) {
+    if (0 != file_mgr_init(&mgr, TEST_DIR, TEST_MAX, 8000000)) {
         printf("FAIL: init 失败\n");
         return -1;
     }
