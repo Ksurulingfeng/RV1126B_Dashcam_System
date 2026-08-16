@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <libavformat/avformat.h>
@@ -688,6 +689,25 @@ static int find_avcc_from_peer(const char *dir, uint8_t *out, int out_size)
 
 
 /*****************************************************************************
+ * 函数名称：file_openable
+ * 功能描述：用 avformat 试探文件能否 demux（打开即算，不读帧）
+ * 输入参数：@filepath - 文件完整路径
+ * 返回值：  可打开返回 true
+ *****************************************************************************/
+static bool file_openable(const char *filepath)
+{
+    AVFormatContext *ctx = NULL;
+    bool ok = false;
+
+    if (0 == avformat_open_input(&ctx, filepath, NULL, NULL)) {
+        ok = true;
+        avformat_close_input(&ctx);
+    }
+    return ok;
+}
+
+
+/*****************************************************************************
  * 函数名称：video_recover_file
  * 功能描述：恢复单个断电残留文件（探测 → 扫描 → 重建 → 原子替换）
  * 输入参数：@path - 残留文件完整路径
@@ -715,7 +735,10 @@ int video_recover_file(const char *path, uint32_t fps)
     int i;
     int ret = -1;
 
-    if (moov_probe(path)) {
+    /* 完好判定 = 有 moov 且 avformat 能打开。robust muxing 时代的
+     * 坏文件只有文件头小 moov（样本表恒 0 不可播），探测会误判
+     * 封口，需 demux 试探兜底 */
+    if (moov_probe(path) && file_openable(path)) {
         return 0; /* 完好文件，无需恢复 */
     }
     fp = fopen(path, "rb");
@@ -866,9 +889,16 @@ int video_recover_scan_dir(const char *dir, uint32_t fps)
         char *dot = strrchr(entry->d_name, '.');
 
         if ((NULL != dot) && (0 == strcmp(dot, ".mp4"))) {
+            struct stat st;
+
             snprintf(fullpath, sizeof(fullpath), "%s/%s",
                      dir, entry->d_name);
-            if (0 < video_recover_file(fullpath, fps)) {
+            /* 空段残留（断电瞬间刚创建未写入）：无恢复价值直接清理 */
+            if ((0 == stat(fullpath, &st)) &&
+                (RECOVER_MIN_SIZE > st.st_size)) {
+                unlink(fullpath);
+                LOG_I("REC", "清理空段残留: %s", entry->d_name);
+            } else if (0 < video_recover_file(fullpath, fps)) {
                 recovered++;
             }
         }

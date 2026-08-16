@@ -248,23 +248,36 @@ static int decode_first_frame(AVFormatContext *fmt_ctx,
     /* 循环读包：视频包送解码器，音频等其它流的包直接丢弃 */
     while (0 <= av_read_frame(fmt_ctx, pkt)) {
         if (stream_idx == pkt->stream_index) {
-            ret = avcodec_send_packet(codec_ctx, pkt);
-            if (0 > ret) {
-                break; /* 送包失败 */
-            }
+            bool is_cfg_nal = false;
 
-            ret = avcodec_receive_frame(codec_ctx, frame);
-            if (0 == ret) {
-                is_got_frame = true;
-                break; /* 第一帧到手 */
+            /* 跳过配置/辅助 NAL（SPS/PPS/SEI/AUD）：崩溃恢复
+             * 文件的 mdat 含流内 SPS/PPS 样本，与 extradata 的
+             * avcC 重复会致新版解码器 "missing picture" 报错 */
+            if (4 < pkt->size) {
+                int nal_type = pkt->data[4] & 0x1F;
+
+                is_cfg_nal = ((6 == nal_type) || (7 == nal_type) ||
+                              (8 == nal_type) || (9 == nal_type));
             }
-            if ((AVERROR(EAGAIN) != ret) && (AVERROR_EOF != ret)) {
-                break; /* 其他解码错误 */
+            if (false == is_cfg_nal) {
+                ret = avcodec_send_packet(codec_ctx, pkt);
+                if (0 > ret) {
+                    break; /* 送包失败 */
+                }
+
+                ret = avcodec_receive_frame(codec_ctx, frame);
+                if (0 == ret) {
+                    is_got_frame = true;
+                    break; /* 第一帧到手 */
+                }
+                if ((AVERROR(EAGAIN) != ret) && (AVERROR_EOF != ret)) {
+                    break; /* 其他解码错误 */
+                }
+                if (AVERROR_EOF == ret) {
+                    break; /* 码流结束仍未出帧 */
+                }
+                /* EAGAIN：解码器需要更多包，继续循环 */
             }
-            if (AVERROR_EOF == ret) {
-                break; /* 码流结束仍未出帧 */
-            }
-            /* EAGAIN：解码器需要更多包，继续循环 */
         }
         av_packet_unref(pkt);
     }
