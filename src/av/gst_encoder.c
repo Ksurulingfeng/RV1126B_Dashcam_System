@@ -210,11 +210,11 @@ static void build_launch_string(char *buf, size_t size,
         PREVIEW_BRANCH_W, PREVIEW_BRANCH_H);
 
     /* 音频分支（启动期开关；手册官方配置：default 设备 +
-     * 48k 双声道 + AAC） */
+     * 48k 单声道 + AAC，板载咪头物理单麦克风） */
     if (config->audio_enabled) {
         snprintf(buf + off, size - (size_t)off,
             "alsasrc device=default ! "
-            "audio/x-raw,format=S16LE,rate=48000,channels=2 ! "
+            "audio/x-raw,format=S16LE,rate=48000,channels=1 ! "
             "audioconvert ! audioresample ! avenc_aac bitrate=64000 ! "
             "aacparse ! mux.audio_0");
     }
