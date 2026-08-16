@@ -23,16 +23,10 @@
 #include "touch_input.h"
 #include "ui_main.h"
 #include "ui_pages.h"
+#include "ui_theme.h"
 
 /* 中文字体（思源黑体，freetype 渲染） */
 #define UI_FONT_PATH "/usr/share/fonts/source-han-sans-cn/SourceHanSansCN-Normal.otf"
-
-/* 主题颜色（简约风格：深灰黑 + 白灰文字，彩色仅 REC 红） */
-#define UI_COLOR_BG     0x0E0E12 /* 页面背景（近黑） */
-#define UI_COLOR_CARD   0x1C1C1E /* 卡片底色（深灰） */
-#define UI_COLOR_REC    0xFF3B30 /* 录制红（唯一彩色） */
-#define UI_COLOR_TEXT   0xFFFFFF /* 主文本（白） */
-#define UI_COLOR_TEXT2  0x8A8A8E /* 次文本（灰） */
 
 /* 布局常量（1280×720 逻辑分辨率） */
 #define UI_STATUS_BAR_H 48        /* 顶部状态栏高度 */
@@ -209,15 +203,16 @@ static void rec_breath_exec(void* obj, int32_t opa)
 /*****************************************************************************
  * 函数名称：ui_nav_to
  * 功能描述：跳转页面（平级导航，无返回栈；带动画加载目标页）
- * 输入参数：@target - 目标页面
+ * 输入参数：@target    - 目标页面
+ *           @anim_type - 切换动画方向（进子页向左，回主页向右）
  * 注意事项：目标页已是当前页时跳过（防重复加载动画闪烁）
  *****************************************************************************/
-static void ui_nav_to(lv_obj_t* target)
+static void ui_nav_to(lv_obj_t* target, lv_scr_load_anim_t anim_type)
 {
     if (target == lv_scr_act()) {
         return;
     }
-    lv_scr_load_anim(target, LV_SCR_LOAD_ANIM_MOVE_LEFT, 200, 0, false);
+    lv_scr_load_anim(target, anim_type, 200, 0, false);
 }
 
 /*****************************************************************************
@@ -243,21 +238,21 @@ static void ui_nav_event_cb(lv_event_t* e)
             if (NULL == s_screen_library) {
                 s_screen_library = ui_page_library_create(ui);
             }
-            ui_page_library_refresh();
-            ui_nav_to(s_screen_library);
+            /* 已在库页时跳过强制重建，避免整页闪烁
+             * （每秒刷新定时器负责增量更新） */
+            if (s_screen_library != lv_scr_act()) {
+                ui_page_library_refresh();
+            }
+            ui_nav_to(s_screen_library, LV_SCR_LOAD_ANIM_MOVE_LEFT);
             break;
         case 1: /* 设置 */
             if (NULL == s_screen_settings) {
                 s_screen_settings = ui_page_settings_create(ui);
             }
-            ui_nav_to(s_screen_settings);
+            ui_nav_to(s_screen_settings, LV_SCR_LOAD_ANIM_MOVE_LEFT);
             break;
         case 2: /* 主页（平级直达，无返回栈） */
-            if (s_screen_live != lv_scr_act()) {
-                lv_scr_load_anim(s_screen_live,
-                                 LV_SCR_LOAD_ANIM_MOVE_RIGHT, 200, 0,
-                                 false);
-            }
+            ui_nav_to(s_screen_live, LV_SCR_LOAD_ANIM_MOVE_RIGHT);
             break;
         default:
             break;
@@ -360,7 +355,7 @@ static void ui_create_status_bar(lv_obj_t* parent)
 
 /*****************************************************************************
  * 函数名称：ui_nav_bar_create
- * 功能描述：创建右侧竖排导航栏（录像/设置/主页/返回，各页面共用）
+ * 功能描述：创建右侧竖排导航栏（录像/设置/主页，各页面共用）
  * 输入参数：@parent - 父对象
  *           @ui     - UI 上下文（按钮回调）
  * 注意事项：全局导航组件，每个页面创建一份（LVGL 对象不可跨父级共享）
@@ -368,12 +363,14 @@ static void ui_create_status_bar(lv_obj_t* parent)
 void ui_nav_bar_create(lv_obj_t* parent, ui_worker_t* ui)
 {
     static const char* const nav_texts[] = {"录像", "设置", "主页"};
+    int btn_count = (int)(sizeof(nav_texts) / sizeof(nav_texts[0]));
     lv_obj_t* bar = lv_obj_create(parent);
     lv_obj_t* btn;
     lv_obj_t* label;
     int i;
 
-    /* 右侧导航栏：竖排 3 键（平级导航，无返回键） */
+    /* 右侧导航栏：竖排平级导航（无返回键），
+     * 按钮个数由文本表推导，增删条目同步生效 */
     lv_obj_set_size(bar, UI_NAV_BAR_W, lv_pct(100));
     lv_obj_align(bar, LV_ALIGN_TOP_RIGHT, 0, 0);
     lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, 0);
@@ -385,8 +382,8 @@ void ui_nav_bar_create(lv_obj_t* parent, ui_worker_t* ui)
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 3 个导航按钮（卡片灰底白字） */
-    for (i = 0; i < 3; i++) {
+    /* 导航按钮（卡片灰底白字） */
+    for (i = 0; i < btn_count; i++) {
         btn = lv_btn_create(bar);
         lv_obj_set_size(btn, UI_NAV_BAR_W - 32, UI_NAV_BTN_H);
         lv_obj_set_style_bg_color(btn, lv_color_hex(UI_COLOR_CARD), 0);

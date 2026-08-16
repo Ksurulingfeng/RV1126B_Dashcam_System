@@ -15,13 +15,7 @@
 #include "thumb_pipeline.h"
 #include "settings.h"
 #include "ui_pages.h"
-
-/* 主题颜色（简约风格：深灰黑 + 白灰文字，彩色仅 REC 红） */
-#define UI_COLOR_BG     0x0E0E12 /* 页面背景（近黑） */
-#define UI_COLOR_CARD   0x1C1C1E /* 卡片底色（深灰） */
-#define UI_COLOR_TEXT   0xFFFFFF /* 主文本（白） */
-#define UI_COLOR_TEXT2  0x8A8A8E /* 次文本（灰） */
-#define UI_COLOR_REC    0xFF3B30 /* REC 红（唯一彩色：录制/开关开启/选中） */
+#include "ui_theme.h"
 
 /* 文件库单页最大显示条目
  * 注意：板端预编译 LVGL 的 LV_MEM_SIZE 仅 48KB，
@@ -401,8 +395,9 @@ static void ui_library_rebuild(void)
         return;
     }
 
-    /* 总文件数（分页计算基准） */
-    total = file_mgr_get_count(s_lib_ui->file_mgr);
+    /* 可展示文件总数（分页计算基准）：未封口的最新分段
+     * 不显示在文件库，口径须与 get_list(skip_tail) 一致 */
+    total = file_mgr_get_listable_count(s_lib_ui->file_mgr);
     if (0 > total) {
         return;
     }
@@ -648,7 +643,7 @@ typedef enum {
     SETTINGS_SW_AI_DRAW, /* AI 检测框绘制 */
     SETTINGS_SW_AI_LOCK, /* person 紧急自动锁定 */
     SETTINGS_SW_RECORD,  /* 录像 */
-    SETTINGS_SW_AUDIO,   /* 录音（占位） */
+    SETTINGS_SW_AUDIO,   /* 录音（启动期生效） */
 } settings_sw_id_t;
 
 /*****************************************************************************
@@ -668,9 +663,10 @@ static void settings_switch_cb(lv_event_t* e)
     switch (id) {
         case SETTINGS_SW_AI:
             settings_set_ai_enabled(on);
-            /* 从属联动：总闸关闭时子开关强制关闭并置灰
-             * （clear CHECKED 会触发子开关自身回调同步配置），
-             * 总闸开启时恢复可操作（状态保持关闭由用户重开） */
+            /* 从属联动：总闸关闭时子开关强制关闭并置灰；
+             * 注意 clear CHECKED 不会触发子开关回调（LVGL 仅在
+             * 点击路径发 VALUE_CHANGED），配置需显式同步 */
+
             if (on) {
                 lv_obj_clear_state(s_sw_ai_draw, LV_STATE_DISABLED);
                 lv_obj_clear_state(s_sw_ai_lock, LV_STATE_DISABLED);
@@ -704,16 +700,16 @@ static void settings_switch_cb(lv_event_t* e)
 /*****************************************************************************
  * 函数名称：ui_settings_add_switch
  * 功能描述：向分组卡片添加一行开关（左标签 + 右 lv_switch）
- * 输入参数：@parent   - 分组卡片
- *           @key      - 开关名称
- *           @initial  - 初始开关状态
- *           @disabled - 禁用（占位功能用，灰色不可点）
- *           @id       - 回调标识（settings_sw_id_t）
+ * 输入参数：@parent  - 分组卡片
+ *           @key     - 开关名称
+ *           @initial - 初始开关状态
+ *           @id      - 回调标识（settings_sw_id_t）
  * 返回值：  开关对象（供从属联动禁用）
+ * 注意事项：禁用手势统一由调用方 add_state(DISABLED) 承担
  *****************************************************************************/
 static lv_obj_t* ui_settings_add_switch(lv_obj_t* parent,
                                          const char* key,
-                                         bool initial, bool disabled,
+                                         bool initial,
                                          settings_sw_id_t id)
 {
     lv_obj_t* row = lv_obj_create(parent);
@@ -744,24 +740,19 @@ static lv_obj_t* ui_settings_add_switch(lv_obj_t* parent,
     if (initial) {
         lv_obj_add_state(sw, LV_STATE_CHECKED);
     }
-    if (disabled) {
-        lv_obj_add_state(sw, LV_STATE_DISABLED);
-        lv_obj_add_style(label, &s_style_text_g, 0);
-    } else {
-        lv_obj_add_event_cb(sw, settings_switch_cb, LV_EVENT_VALUE_CHANGED,
-                            (void*)(intptr_t)id);
-    }
+    lv_obj_add_event_cb(sw, settings_switch_cb, LV_EVENT_VALUE_CHANGED,
+                        (void*)(intptr_t)id);
 
     return sw;
 }
 
-/* 分段时长选项（秒）与按钮引用（复选效果用） */
-#define SEGMENT_CHOICE_1 60
-#define SEGMENT_CHOICE_2 120
-#define SEGMENT_CHOICE_3 300
-static lv_obj_t* s_seg_btns[3];
-static const uint32_t s_seg_choices[3] = {
-    SEGMENT_CHOICE_1, SEGMENT_CHOICE_2, SEGMENT_CHOICE_3
+/* 分段时长选项（秒）与按钮引用（复选效果用）
+ * 注意：数组顺序与按钮布局严格对齐——按钮从右往左排列
+ * 5分/2分/1分，choices[0] 必须对应最右按钮（300 秒） */
+#define SEGMENT_CHOICE_COUNT 3
+static lv_obj_t* s_seg_btns[SEGMENT_CHOICE_COUNT];
+static const uint32_t s_seg_choices[SEGMENT_CHOICE_COUNT] = {
+    300, 120, 60
 };
 
 /*****************************************************************************
@@ -777,8 +768,8 @@ static void segment_btn_cb(lv_event_t* e)
     settings_set_segment_sec(s_seg_choices[idx]);
     settings_save();
 
-    /* 复选效果：当前按钮选中（绿底），其余清除 */
-    for (i = 0; i < 3; i++) {
+    /* 复选效果：当前按钮选中（REC 红底），其余清除 */
+    for (i = 0; i < SEGMENT_CHOICE_COUNT; i++) {
         if (NULL == s_seg_btns[i]) {
             break;
         }
@@ -796,12 +787,13 @@ static void segment_btn_cb(lv_event_t* e)
  * 输入参数：@parent - 分组卡片
  * 注意事项：按钮 88×64 达触摸规范；按钮文字必须用中文字体
  *           样式（freetype），默认字体无中文会乱码；
- *           当前选择按钮以绿底复选高亮
+ *           当前选择按钮以 REC 红底复选高亮
  *****************************************************************************/
 static void ui_settings_add_segment_row(lv_obj_t* parent)
 {
     lv_obj_t* row = lv_obj_create(parent);
     lv_obj_t* label;
+    char label_buf[8];
     uint32_t i;
     uint32_t cur = settings_get_segment_sec();
 
@@ -814,8 +806,9 @@ static void ui_settings_add_segment_row(lv_obj_t* parent)
     lv_obj_add_style(label, &s_style_text_w, 0);
     lv_label_set_text(label, "分段时长");
 
-    /* 三按钮从右往左排列（5分/2分/1分） */
-    for (i = 0; i < 3; i++) {
+    /* 三按钮从右往左排列（5分/2分/1分），标签由秒数推导
+     * （单一事实来源，与 choices 表不会错位） */
+    for (i = 0; i < SEGMENT_CHOICE_COUNT; i++) {
         lv_obj_t* btn = lv_btn_create(row);
 
         lv_obj_set_size(btn, 88, 64);
@@ -832,13 +825,9 @@ static void ui_settings_add_segment_row(lv_obj_t* parent)
         label = lv_label_create(btn);
         lv_obj_center(label);
         lv_obj_add_style(label, &s_style_text_w, 0);
-        if (0 == i) {
-            lv_label_set_text(label, "5分");
-        } else if (1 == i) {
-            lv_label_set_text(label, "2分");
-        } else {
-            lv_label_set_text(label, "1分");
-        }
+        snprintf(label_buf, sizeof(label_buf), "%u分",
+                 s_seg_choices[i] / 60);
+        lv_label_set_text(label, label_buf);
 
         /* 初始复选状态：当前配置值对应按钮高亮 */
         if (s_seg_choices[i] == cur) {
@@ -889,25 +878,25 @@ lv_obj_t* ui_page_settings_create(ui_worker_t* ui)
     /* 功能开关分组 */
     card = ui_settings_group_create(scroll, "功能开关");
     ui_settings_add_switch(card, "AI 识别", settings_get_ai_enabled(),
-                           false, SETTINGS_SW_AI);
+                           SETTINGS_SW_AI);
     s_sw_ai_draw = ui_settings_add_switch(
         card, "AI 识别画框",
         settings_get_ai_enabled() && settings_get_ai_draw_box(),
-        false, SETTINGS_SW_AI_DRAW);
+        SETTINGS_SW_AI_DRAW);
     s_sw_ai_lock = ui_settings_add_switch(
         card, "紧急自动锁定",
         settings_get_ai_enabled() && settings_get_ai_auto_lock(),
-        false, SETTINGS_SW_AI_LOCK);
+        SETTINGS_SW_AI_LOCK);
     /* 总开关当前关闭：子开关初始即禁用 */
     if (!settings_get_ai_enabled()) {
         lv_obj_add_state(s_sw_ai_draw, LV_STATE_DISABLED);
         lv_obj_add_state(s_sw_ai_lock, LV_STATE_DISABLED);
     }
     ui_settings_add_switch(card, "录像", settings_get_record_enabled(),
-                           false, SETTINGS_SW_RECORD);
+                           SETTINGS_SW_RECORD);
     ui_settings_add_switch(card, "录音（重启生效）",
                            settings_get_audio_enabled(),
-                           false, SETTINGS_SW_AUDIO);
+                           SETTINGS_SW_AUDIO);
 
     /* 录像参数分组 */
     card = ui_settings_group_create(scroll, "录像参数");

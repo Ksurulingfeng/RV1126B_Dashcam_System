@@ -22,6 +22,13 @@
 /* 扫描缓冲初始容量（文件数），不足自动翻倍 */
 #define SCAN_INIT_CAPACITY 32
 
+/* 字节转位系数（时长估算 size×8÷码率） */
+#define BITS_PER_BYTE 8
+
+/* moov 探测窗口（字节）：非分片 mp4mux 的 moov 索引写在文件末尾，
+ * 只读末尾这一窗口即可判断封口状态 */
+#define MOOV_PROBE_SIZE (128 * 1024)
+
 
 /* =========================================================================
  * 内部队列操作（调用方需持有 mgr->mutex）
@@ -238,6 +245,11 @@ static int scan_dir_entries(const char *path, uint32_t avg_bitrate,
     int capacity = 0;
     int count = 0;
 
+    /* 防御未初始化管理器：avg_bitrate 为 0 时下方除法会 SIGFPE */
+    if ((NULL == path) || (0 == avg_bitrate)) {
+        return -1;
+    }
+
     dir = opendir(path);
     if (NULL == dir) {
         return -1;
@@ -274,7 +286,7 @@ static int scan_dir_entries(const char *path, uint32_t avg_bitrate,
                 ve.size      = (uint64_t)file_stat.st_size;
                 ve.timestamp = file_stat.st_mtime;
                 ve.is_locked = name_is_emergency(entry->d_name);
-                ve.duration_sec = (uint32_t)(ve.size * 8 /
+                ve.duration_sec = (uint32_t)(ve.size * BITS_PER_BYTE /
                                              avg_bitrate);
                 entries[count++] = ve;
             }
@@ -285,6 +297,102 @@ static int scan_dir_entries(const char *path, uint32_t avg_bitrate,
     *out_entries = entries;
     *out_count = count;
     return 0;
+}
+
+
+/*****************************************************************************
+ * 函数名称：file_is_sealed
+ * 功能描述：探测 MP4 是否已封口（文件末尾含合法 moov 索引）
+ * 输入参数：@filepath - 文件完整路径
+ * 返回值：  已封口返回 true；未封口（splitmuxsink 正在写）返回 false
+ * 注意事项：只读文件末尾 MOOV_PROBE_SIZE 字节；从后往前找 moov
+ *           魔数并校验 box 长度落在文件范围内，避免把 mdat 数据里
+ *           偶然出现的 "moov" 字节误判为索引
+ *****************************************************************************/
+static bool file_is_sealed(const char *filepath)
+{
+    FILE *fp = NULL;
+    uint8_t *buf = NULL;
+    long file_size;
+    long probe_size;
+    long i;
+    bool sealed = false;
+
+    fp = fopen(filepath, "rb");
+    if (NULL == fp) {
+        return false;
+    }
+    if (0 != fseek(fp, 0, SEEK_END)) {
+        goto done;
+    }
+    file_size = ftell(fp);
+    if (8 > file_size) {
+        goto done; /* 太小不可能有 moov */
+    }
+
+    probe_size = (file_size < (long)MOOV_PROBE_SIZE) ?
+                 file_size : (long)MOOV_PROBE_SIZE;
+    buf = (uint8_t *)malloc((size_t)probe_size);
+    if (NULL == buf) {
+        goto done;
+    }
+    if (0 != fseek(fp, file_size - probe_size, SEEK_SET)) {
+        goto done;
+    }
+    if (probe_size != (long)fread(buf, 1, (size_t)probe_size, fp)) {
+        goto done;
+    }
+
+    /* 从后往前找 "moov" 魔数，box 头 4 字节是长度（大端）。
+     * 注意起点须为 probe_size-4：类型字段可出现在文件末尾
+     * 4 字节处（最小 8 字节 box 恰在窗口边缘） */
+    for (i = probe_size - 4; i >= 4; i--) {
+        uint32_t box_size;
+        long box_start;
+
+        if (0 == memcmp(buf + i, "moov", 4)) {
+            box_size = ((uint32_t)buf[i - 4] << 24) |
+                       ((uint32_t)buf[i - 3] << 16) |
+                       ((uint32_t)buf[i - 2] << 8) |
+                       (uint32_t)buf[i - 1];
+            box_start = file_size - probe_size + (i - 4);
+            /* 长度 ≥8 且 box 不超出文件范围才算合法索引 */
+            if ((8 <= box_size) &&
+                ((long)box_size <= file_size - box_start)) {
+                sealed = true;
+            }
+            break;
+        }
+    }
+
+done:
+    free(buf);
+    fclose(fp);
+    return sealed;
+}
+
+
+/*****************************************************************************
+ * 函数名称：scan_find_newest
+ * 功能描述：从扫描结果中找最新条目（与 queue_sort 排序键一致）
+ * 输入参数：@entries - 扫描结果数组
+ *           @count   - 数组元素数
+ * 返回值：  最新条目指针，数组为空返回 NULL
+ *****************************************************************************/
+static video_entry_t *scan_find_newest(video_entry_t *entries, int count)
+{
+    video_entry_t *best = NULL;
+    int i;
+
+    for (i = 0; i < count; i++) {
+        if ((NULL == best) ||
+            (entries[i].timestamp > best->timestamp) ||
+            ((entries[i].timestamp == best->timestamp) &&
+             (strcmp(entries[i].filepath, best->filepath) > 0))) {
+            best = &entries[i];
+        }
+    }
+    return best;
 }
 
 
@@ -347,9 +455,18 @@ int file_mgr_init(file_mgr_t *mgr, const char *path, uint64_t max_size,
         memset(mgr, 0, sizeof(file_mgr_t));
         return -1;
     }
-    pthread_mutex_lock(&mgr->mutex);
-    queue_rebuild(mgr, entries, count);
-    pthread_mutex_unlock(&mgr->mutex);
+
+    /* 最新文件封口状态（锁外 I/O 探测 moov，避免持锁读盘）；
+     * 断电残留的未封口分段在重启后据此从文件库隐藏 */
+    {
+        video_entry_t *newest = scan_find_newest(entries, count);
+        bool sealed = (NULL != newest) && file_is_sealed(newest->filepath);
+
+        pthread_mutex_lock(&mgr->mutex);
+        queue_rebuild(mgr, entries, count);
+        mgr->tail_sealed = sealed;
+        pthread_mutex_unlock(&mgr->mutex);
+    }
     free(entries);
 
     return 0;
@@ -496,6 +613,33 @@ int file_mgr_get_count(file_mgr_t *mgr)
 
 
 /*****************************************************************************
+ * 函数名称：file_mgr_get_listable_count
+ * 功能描述：查询可展示的文件数（不含未封口的最新分段）
+ * 输入参数：@mgr - 管理器指针
+ * 返回值：  可展示文件数（≥0），mgr 为空返回 -1
+ * 注意事项：供 UI 分页计算——get_count 含正在写的分段，
+ *           本接口与 get_list(skip_tail=true) 口径对齐
+ *****************************************************************************/
+int file_mgr_get_listable_count(file_mgr_t *mgr)
+{
+    int count;
+
+    if (NULL == mgr) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&mgr->mutex);
+    count = (int)mgr->entry_count;
+    if ((0 < count) && (false == mgr->tail_sealed)) {
+        count--;
+    }
+    pthread_mutex_unlock(&mgr->mutex);
+
+    return count;
+}
+
+
+/*****************************************************************************
  * 函数名称：file_mgr_get_used
  * 功能描述：查询当前已用空间（字节）
  * 输入参数：@mgr - 管理器指针
@@ -519,7 +663,7 @@ uint64_t file_mgr_get_used(file_mgr_t *mgr)
 
 /*****************************************************************************
  * 函数名称：file_mgr_get_latest
- * 功能描述：获取队列中最新录像文件的完整路径（正在写入的分段）
+ * 功能描述：获取队列中最新录像文件的完整路径
  * 输入参数：@mgr       - 管理器指针
  *           @path      - 输出路径缓冲
  *           @path_size - 输出缓冲大小（字节）
@@ -554,8 +698,9 @@ int file_mgr_get_latest(file_mgr_t *mgr, char *path, size_t path_size)
  *           @out       - 输出数组（调用方分配，video_entry_t[max]）
  *           @max       - 输出数组容量
  *           @offset    - 跳过最新 offset 个文件（分页：页码×页容量）
- *           @skip_tail - 跳过 tail 节点（通常是正在写入的分段，
- *                        未封口无 moov，不应出现在文件库列表）
+ *           @skip_tail - 跳过未封口的最新分段（splitmuxsink 正在写，
+ *                        无 moov 不可播，不应出现在文件库列表；
+ *                        封口状态按 mgr->tail_sealed 判定）
  * 返回值：  拷贝的文件数（0 表示队列为空或 offset 越界），失败返回 -1
  * 注意事项：锁内快照拷贝，调用方拿到的是独立数据，无并发风险
  *****************************************************************************/
@@ -573,10 +718,10 @@ int file_mgr_get_list(file_mgr_t *mgr, video_entry_t *out, int max,
     pthread_mutex_lock(&mgr->mutex);
 
     /* 从 tail（最新）向 head（最旧）遍历，最新文件排在前面：
-     * 先跳过正在写的分段与 offset 个（上一页内容），
+     * 先跳过未封口的最新分段与 offset 个（上一页内容），
      * 再拷贝最多 max 个 */
     cur = mgr->tail;
-    if (skip_tail && (NULL != cur)) {
+    if (skip_tail && (NULL != cur) && (false == mgr->tail_sealed)) {
         cur = cur->prev;
     }
     while ((NULL != cur) && (skipped < offset)) {
@@ -618,13 +763,20 @@ int file_mgr_check(file_mgr_t *mgr)
         return -1;
     }
 
-    /* 锁内重建队列（纯内存操作，持锁时间极短） */
-    pthread_mutex_lock(&mgr->mutex);
-    queue_rebuild(mgr, entries, count);
-    if (mgr->current_used > mgr->max_total_size) {
-        need = mgr->current_used - mgr->max_total_size;
+    /* 最新文件封口状态（锁外 I/O 探测 moov） */
+    {
+        video_entry_t *newest = scan_find_newest(entries, count);
+        bool sealed = (NULL != newest) && file_is_sealed(newest->filepath);
+
+        /* 锁内重建队列（纯内存操作，持锁时间极短） */
+        pthread_mutex_lock(&mgr->mutex);
+        queue_rebuild(mgr, entries, count);
+        mgr->tail_sealed = sealed;
+        if (mgr->current_used > mgr->max_total_size) {
+            need = mgr->current_used - mgr->max_total_size;
+        }
+        pthread_mutex_unlock(&mgr->mutex);
     }
-    pthread_mutex_unlock(&mgr->mutex);
     free(entries);
 
     /* 超限删除（evict 内部自行加锁） */

@@ -6,11 +6,13 @@
 
 本项目以正点原子 ATK-DLRV1126B 开发板为硬件平台，实现了一台功能完整的智能行车记录仪：
 
-- **1080P 循环录像**：GStreamer 管线硬件编码（MPP），5 分钟无缝分段，SD 卡满自动覆盖最旧录像
-- **断电保护**：robust muxing——moov 索引每秒刷新磁盘，断电/强杀最多丢 1 秒录像，已录内容永远可播
+- **1080P 循环录像**：GStreamer 管线硬件编码（MPP），分段时长可设（默认 2 分钟），SD 卡满自动覆盖最旧录像
+- **断电保护**：短分段兜底 + SIGTERM EOS 优雅封口写 moov 索引，断电最多丢最后一段；文件库按 moov 封口探测自动隐藏未完成分段
+- **音视频双轨录像**：板载咪头 48kHz 单声道 AAC 录音，与视频同封装（mp4mux 音视频双轨 MP4）
 - **紧急锁定保护**：AI 检测到 person 连续 3 帧自动锁定当前分段（`_E` 后缀持久化），循环覆盖永不删除
 - **AI 目标检测**：YOLOv5s 部署于 3.0 TOPS NPU（RKNN INT8 量化），实测约 40fps，检测框实时绘制
 - **触摸交互 UI**：LVGL 8.4 + DRM 90° 旋转，自写 Goodix 电容触摸驱动，多页面架构（主页/录像库/设置）
+- **设置体系**：AI 识别（画框/自动锁定从属联动）、录像、录音、分段时长五项开关，key=value 配置持久化，主循环秒级巡检应用
 - **GPS 定位**：EC20 4G 模块 NMEA 0183 解析（GGA/RMC），状态栏实时显示
 - **FFmpeg 离线处理**：录像缩略图生成（解码抽帧 → 手写 BMP 落盘），回放/导出/修复的扩展基座
 
@@ -42,15 +44,19 @@
 
 ```
 IMX415 → v4l2src → capsfilter(NV12/1080P) → tee ─┬→ queue → mpph264enc(硬编码)
-                                                  │     → h264parse → splitmuxsink
-                                                  │       (5分钟分段 + robust muxing：
-                                                  │        moov 每秒刷新，断电最多丢 1 秒)
+                                                  │     → valve(录像开关) → h264parse
+                                                  │     → splitmuxsink（分段时长可设，
+                                                  │        默认 mp4mux：EOS/切段封口
+                                                  │        写 moov 索引）
+                                                  │       + alsasrc(48k 单声道)
+                                                  │         → AAC → 同段音视频双轨
                                                   └→ queue(限1帧丢旧) → videoscale(720p)
                                                         → tee2 ─┬→ appsink(NV12) → AI 推理
                                                                 └→ videoconvert(BGRA)
                                                                    → appsink → UI 直拷
                                                         ↓
-                                    file_mgr 巡检（超限删最旧、_E 锁定保护）
+                                    file_mgr 巡检（超限删最旧、_E 锁定保护、
+                                                 moov 封口探测隐藏未完成分段）
 ```
 
 ### AI 链路
@@ -94,7 +100,7 @@ RV1126B_Dashcam_System/
 │   ├── av/           # 音视频（gst_encoder 分段录像 + thumb_gen FFmpeg 缩略图）
 │   ├── core/         # 核心业务（file_mgr 目录守护：锁定/巡检删除）
 │   ├── gps/          # GPS（nmea_parser 解析 + gps_worker 线程）
-│   ├── common/       # 公共组件（thread_mgr + preview_share/detect_share 共享 + log 日志）
+│   ├── common/       # 公共组件（thread_mgr + preview_share/detect_share 共享 + settings 配置 + log 日志）
 │   ├── ui/           # 图形界面（LVGL 多页面 + touch_input 触摸驱动）
 │   ├── ai/           # AI 推理（YOLOv5s RKNN + 检测框 + 紧急联动）
 │   ├── network/      # 网络（RTSP 推流、云端上传规划中）
@@ -146,9 +152,10 @@ printf 'AT+QGPS=1\r' > /dev/ttyUSB2
 ### 单元测试（PC 端，无需开发板）
 
 ```bash
-# file_mgr（循环覆盖 + 锁定保护）
-gcc -std=c11 -Wall -I src/core -o /tmp/test_file_mgr \
-    src/core/file_mgr.c src/test/test_file_mgr.c && /tmp/test_file_mgr
+# file_mgr（循环覆盖 + 锁定保护 + moov 封口探测）
+gcc -std=c11 -Wall -I src/core -I src/common -o /tmp/test_file_mgr \
+    src/core/file_mgr.c src/test/test_file_mgr.c -lpthread \
+    && /tmp/test_file_mgr
 
 # nmea_parser（GGA/RMC 解析）
 gcc -std=c11 -Wall -I src/gps -o /tmp/test_nmea \

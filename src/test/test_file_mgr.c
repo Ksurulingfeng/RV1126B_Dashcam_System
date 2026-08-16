@@ -37,6 +37,24 @@ static void make_segment(const char *name, int size_kb)
     fclose(fp);
 }
 
+/* 在文件末尾追加最小 moov 索引（8 字节：长度+魔数），模拟封口 */
+static void append_moov(const char *name)
+{
+    char path[512];
+    FILE *fp;
+    uint8_t moov_box[8] = {0x00, 0x00, 0x00, 0x08,
+                           'm', 'o', 'o', 'v'};
+
+    snprintf(path, sizeof(path), "%s/%s", TEST_DIR, name);
+    fp = fopen(path, "ab");
+    if (NULL == fp) {
+        printf("FAIL: 追加 moov 失败 %s\n", name);
+        return;
+    }
+    fwrite(moov_box, 1, sizeof(moov_box), fp);
+    fclose(fp);
+}
+
 int main(void)
 {
     file_mgr_t mgr;
@@ -84,6 +102,9 @@ int main(void)
     printf("  巡检后队列: %d 个文件, 已用: %llu MB（上限 10MB）\n",
            file_mgr_get_count(&mgr),
            (unsigned long long)(mgr.current_used / 1024 / 1024));
+    /* 测试文件无 moov（未封口），tail 不计入可展示数 */
+    printf("  可展示: %d 个（不含未封口 tail）\n",
+           file_mgr_get_listable_count(&mgr));
     printf("PASS\n\n");
 
     /* 场景5：验证最旧文件被删、_E 文件保留 */
@@ -100,8 +121,32 @@ int main(void)
     system("ls " TEST_DIR "/*.mp4 2>/dev/null | sort | head -3 | xargs echo oldest_files:");
     printf("PASS\n\n");
 
+    /* 场景6：封口探测——有 moov 的最新分段可展示，未封口的被跳过 */
+    printf("===== 场景6: 封口探测 =====\n");
+    make_segment("rec_00090.mp4", 100); /* 未封口：模拟正在写 */
+    file_mgr_check(&mgr);
+    printf("  可展示: %d 个（tail 未封口，应比总数少 1）\n",
+           file_mgr_get_listable_count(&mgr));
+    {
+        video_entry_t list[8];
+        int n = file_mgr_get_list(&mgr, list, 8, 0, true);
+        printf("  列表第 1 个: %s（应跳过未封口 tail）\n",
+               (0 < n) ? list[0].filepath : "空");
+    }
+    append_moov("rec_00090.mp4"); /* 补 moov：模拟分段封口 */
+    file_mgr_check(&mgr);
+    printf("  封口后可展示: %d 个（应恢复全量）\n",
+           file_mgr_get_listable_count(&mgr));
+    {
+        video_entry_t list[8];
+        int n = file_mgr_get_list(&mgr, list, 8, 0, true);
+        printf("  列表第 1 个: %s（应含封口 tail）\n",
+               (0 < n) ? list[0].filepath : "空");
+    }
+    printf("PASS\n\n");
+
     /* 收尾 */
-    printf("===== 场景6: 收尾 =====\n");
+    printf("===== 场景7: 收尾 =====\n");
     file_mgr_deinit(&mgr);
     printf("  deinit 完成\n");
     printf("PASS\n\n");

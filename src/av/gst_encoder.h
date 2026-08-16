@@ -24,8 +24,8 @@ typedef struct {
     uint32_t    width;        /* 编码宽度 */
     uint32_t    height;       /* 编码高度 */
     uint32_t    fps;          /* 帧率 */
-    uint32_t    bitrate;      /* 码率（bps），如 8000000 */
-    bool        audio_enabled;/* 录音（启动期开关，构建管线时决定） */
+    uint32_t    bitrate;       /* 码率（bps），如 8000000 */
+    bool        audio_enabled; /* 录音（启动期开关，构建管线时决定） */
 } gst_encoder_config_t;
 
 /* 预览帧回调：appsink 收到新帧时调用（GStreamer 内部线程）

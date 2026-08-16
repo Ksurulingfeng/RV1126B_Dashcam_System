@@ -47,7 +47,8 @@ typedef struct {
     uint32_t        entry_count;       /* 队列中文件数 */
     uint32_t        avg_bitrate;       /* 平均码率（bps），时长估算用 */
     video_node_t   *head;              /* 最旧文件 */
-    video_node_t   *tail;              /* 最新文件（正在写入的分段） */
+    video_node_t   *tail;              /* 最新文件（最新分段） */
+    bool            tail_sealed;       /* tail 已封口（有 moov 可播） */
 } file_mgr_t;
 
 #ifdef __cplusplus
@@ -61,6 +62,7 @@ int  file_mgr_lock_file(file_mgr_t *mgr, const char *filepath);
 int  file_mgr_lock_latest(file_mgr_t *mgr, char *path, size_t path_size);
 int  file_mgr_check(file_mgr_t *mgr);
 int  file_mgr_get_count(file_mgr_t *mgr);
+int  file_mgr_get_listable_count(file_mgr_t *mgr);
 uint64_t file_mgr_get_used(file_mgr_t *mgr);
 int  file_mgr_get_latest(file_mgr_t *mgr, char *path, size_t path_size);
 int  file_mgr_get_list(file_mgr_t *mgr, video_entry_t *out, int max,

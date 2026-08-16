@@ -485,6 +485,7 @@ static void inference_loop(ai_worker_t* worker, rknn_context ctx,
     preproc_result_t preproc;
     detect_result_group_t result_group;
     double infer_ms;
+    bool ai_was_enabled = true;
 
     memset(&lc, 0, sizeof(lc));
     lc.worker    = worker;
@@ -495,33 +496,41 @@ static void inference_loop(ai_worker_t* worker, rknn_context ctx,
     LOG_I("AI", "线程启动，帧源: GStreamer tee 预览分支");
 
     while (*(worker->running)) {
+        bool ai_enabled;
+        bool got_frame;
+
         memset(&preproc, 0, sizeof(preproc));
         memset(&result_group, 0, sizeof(result_group));
         infer_ms = 0.0;
 
-        /* AI 总开关关闭：空转休眠，跳过推理与推结果（省 CPU/NPU） */
-        if (!settings_get_ai_enabled()) {
+        ai_enabled = settings_get_ai_enabled();
+        if (ai_enabled) {
+            /* 重新开启：复位联动状态机——关闭期间 person 离开
+             * 无法被计数，旧锁定状态会造成重开后漏锁 */
+            if (false == ai_was_enabled) {
+                lc.person_streak    = 0;
+                lc.no_person_streak = 0;
+                lc.is_person_locked = false;
+            }
+
+            /* ① 取帧（无新帧则休眠等待，防忙等烧 CPU） */
+            got_frame = loop_capture_show(&lc, frame);
+            if (got_frame) {
+                /* ② 预处理 + 推理 + 后处理 */
+                preproc = loop_preprocess(&lc, frame, resized);
+                if (loop_run_inference(&lc, resized, &preproc,
+                                       &result_group, &infer_ms)) {
+                    /* ③ 紧急录像联动状态机 */
+                    loop_person_state(&lc, &result_group);
+                }
+            } else {
+                usleep(AI_IDLE_WAIT_US);
+            }
+        } else {
+            /* AI 总开关关闭：空转休眠，跳过推理（省 CPU/NPU） */
             usleep(AI_IDLE_WAIT_US);
-            goto next_frame;
         }
-
-        /* ① 取帧 + 画框 + 推 UI（无新帧则休眠等待，防忙等烧 CPU） */
-        if (!loop_capture_show(&lc, frame)) {
-            usleep(AI_IDLE_WAIT_US);
-            goto next_frame;
-        }
-
-        /* ② 预处理 + 推理 + 后处理（RKNN 失败跳到下一轮） */
-        preproc = loop_preprocess(&lc, frame, resized);
-        if (!loop_run_inference(&lc, resized, &preproc,
-                                &result_group, &infer_ms)) {
-            goto next_frame;
-        }
-
-        /* ③ 紧急录像联动状态机 */
-        loop_person_state(&lc, &result_group);
-
-    next_frame:;
+        ai_was_enabled = ai_enabled;
     }
 }
 

@@ -28,9 +28,6 @@
 #define PREVIEW_QUEUE_BUFFERS 1
 #define PREVIEW_QUEUE_LEAKY   2 /* GST_QUEUE_LEAK_DOWNSTREAM */
 
-/* splitmuxsink 文件命名模板缓冲大小 */
-#define LOCATION_BUF_SIZE 512
-
 /* EOS 封口等待上限（秒），超时说明流水线卡死 */
 #define EOS_WAIT_SEC 5
 
@@ -72,29 +69,21 @@ static int get_next_file_index(const char *dir)
 
 
 /*****************************************************************************
- * 函数名称：setup_sink_props
- * 功能描述：配置 splitmuxsink 属性（命名模板 / 分段时长 / 序号接续）
- * 输入参数：@sink   - splitmuxsink 元件
- *           @config - 编码配置
- * 返回值：  成功返回0，失败返回-1
- * 注意事项：默认 mp4mux 在 EOS/切段时写 moov 索引。robust muxing
- *           方案已实测否决（1.24 下文件头刷新不写样本表，断电后
- *           文件不可播），断电保护依赖优雅退出与短分段兜底
+ * 函数名称：setup_audio_gain
+ * 功能描述：设置板载咪头 ADC 增益（录音链路初始化）
+ * 注意事项：正点原子手册 2.4.5 官方配置——不设置录音音量不足；
+ *           amixer 缺失时仅告警不阻断（录音仍可用默认增益）
  *****************************************************************************/
-static int setup_sink_props(GstElement *sink,
-                            const gst_encoder_config_t *config)
+static void setup_audio_gain(void)
 {
-    char location[LOCATION_BUF_SIZE];
-    int start_index;
+    int ret;
 
-    snprintf(location, sizeof(location), "%s/rec_%%05d.mp4", config->dir);
-    start_index = get_next_file_index(config->dir);
-    g_object_set(G_OBJECT(sink), "location", location, NULL);
-    g_object_set(G_OBJECT(sink), "max-size-time",
-                 (guint64)config->segment_sec * GST_SECOND, NULL);
-    g_object_set(G_OBJECT(sink), "start-index", start_index, NULL);
-
-    return 0;
+    ret = system("/usr/bin/amixer -c 0 cset name='ADC OSR Volume ON' 'on'");
+    ret |= system("/usr/bin/amixer -c 0 set 'ADC OSR' 100%");
+    ret |= system("/usr/bin/amixer -c 0 set 'ADC2DAC Mixer' 90%");
+    if (0 != ret) {
+        LOG_W("GST", "录音增益设置失败（amixer 缺失？），录音音量可能偏低");
+    }
 }
 
 
@@ -173,11 +162,14 @@ static GstFlowReturn appsink_bgra_new_sample(GstAppSink *appsink,
  *           @size   - 缓冲大小
  *           @config - 编码配置
  * 输出参数：@buf    - 管线描述串
+ * 返回值：  成功返回0，缓冲不足返回-1
  * 注意事项：全部元件带 name（后续按名取引用设置属性/回调）；
- *           音频分支按 audio_enabled 开关拼接
+ *           音频分支按 audio_enabled 开关拼接；两段 snprintf
+ *           返回值必须校验——被截断的管线串可能恰好合法，
+ *           静默缺少尾段元件极难排查
  *****************************************************************************/
-static void build_launch_string(char *buf, size_t size,
-                                const gst_encoder_config_t *config)
+static int build_launch_string(char *buf, size_t size,
+                               const gst_encoder_config_t *config)
 {
     int off;
 
@@ -208,17 +200,44 @@ static void build_launch_string(char *buf, size_t size,
         PREVIEW_BRANCH_W, PREVIEW_BRANCH_H,
         PREVIEW_QUEUE_BUFFERS, PREVIEW_QUEUE_LEAKY,
         PREVIEW_BRANCH_W, PREVIEW_BRANCH_H);
+    if ((0 > off) || ((size_t)off >= size)) {
+        return -1;
+    }
 
     /* 音频分支（启动期开关；手册官方配置：default 设备 +
      * 48k 单声道 + AAC，板载咪头物理单麦克风） */
     if (config->audio_enabled) {
-        snprintf(buf + off, size - (size_t)off,
+        int off2 = snprintf(buf + off, size - (size_t)off,
             "alsasrc device=default ! "
             "audio/x-raw,format=S16LE,rate=48000,channels=1 ! "
             "audioconvert ! audioresample ! avenc_aac bitrate=64000 ! "
             "aacparse ! mux.audio_0");
+        if ((0 > off2) || ((size_t)(off + off2) >= size)) {
+            return -1;
+        }
     }
+    return 0;
 }
+
+/*****************************************************************************
+ * 函数名称：require_element
+ * 功能描述：按名查找管线元件，缺失时打日志（借用引用，调用方 unref）
+ * 输入参数：@pipeline - 流水线
+ *           @name     - 元件名（build_launch_string 中 name= 定义）
+ * 返回值：  元件指针，缺失返回 NULL
+ * 注意事项：launch 串与代码不同步（改名/拼错）时这里兜底报错，
+ *           避免下游拿着 NULL 静默失效难排查
+ *****************************************************************************/
+static GstElement *require_element(GstElement *pipeline, const char *name)
+{
+    GstElement *elem = gst_bin_get_by_name(GST_BIN(pipeline), name);
+
+    if (NULL == elem) {
+        LOG_E("GST", "管线缺少 %s 元件（launch 串与代码不同步？）", name);
+    }
+    return elem;
+}
+
 
 /*****************************************************************************
  * 函数名称：create_record_pipeline
@@ -228,7 +247,8 @@ static void build_launch_string(char *buf, size_t size,
  * 返回值：  成功返回0，失败返回-1
  * 注意事项：parse 构建与 gst-launch 完全同路径——手写 API
  *           构建在板端实测会致 mux 不输出（0 字节）且原因未
- *           定位，parse 构建稳定可靠
+ *           定位，parse 构建稳定可靠；关键元件按名查找必须
+ *           全部成功，任一缺失即失败（录像/AI/UI 均依赖）
  *****************************************************************************/
 static int create_record_pipeline(gst_encoder_t *enc,
                                   const gst_encoder_config_t *config)
@@ -238,15 +258,16 @@ static int create_record_pipeline(gst_encoder_t *enc,
     GstAppSinkCallbacks cb;
     char launch[2048];
 
-    /* 录音增益（正点原子手册 2.4.5 官方配置：板载咪头默认
-     * 增益很小，不设置录音音量不足） */
+    /* 录音增益（正点原子手册 2.4.5 官方配置） */
     if (config->audio_enabled) {
-        system("/usr/bin/amixer -c 0 cset name='ADC OSR Volume ON' 'on'");
-        system("/usr/bin/amixer -c 0 set 'ADC OSR' 100%");
-        system("/usr/bin/amixer -c 0 set 'ADC2DAC Mixer' 90%");
+        setup_audio_gain();
     }
 
-    build_launch_string(launch, sizeof(launch), config);
+    if (0 != build_launch_string(launch, sizeof(launch), config)) {
+        LOG_E("GST", "管线描述串超长（缓冲 %u 字节）",
+              (unsigned int)sizeof(launch));
+        return -1;
+    }
     pipeline = gst_parse_launch(launch, NULL);
     if (NULL == pipeline) {
         LOG_E("GST", "管线构建失败: %s", launch);
@@ -254,47 +275,65 @@ static int create_record_pipeline(gst_encoder_t *enc,
     }
 
     /* 采集设备 */
-    elem = gst_bin_get_by_name(GST_BIN(pipeline), "camsrc");
+    elem = require_element(pipeline, "camsrc");
     if (NULL == elem) {
-        gst_object_unref(pipeline);
-        return -1;
+        goto error;
     }
     g_object_set(G_OBJECT(elem), "device", config->device, NULL);
     gst_object_unref(elem);
+    elem = NULL;
 
-    /* splitmuxsink：序号接续 */
-    elem = gst_bin_get_by_name(GST_BIN(pipeline), "mux");
+    /* splitmuxsink：序号接续（保存借用引用，bin 持所有权） */
+    elem = require_element(pipeline, "mux");
     if (NULL == elem) {
-        gst_object_unref(pipeline);
-        return -1;
+        goto error;
     }
     g_object_set(G_OBJECT(elem), "start-index",
                  get_next_file_index(config->dir), NULL);
     enc->record_sink = elem;
     gst_object_unref(elem);
+    elem = NULL;
 
     /* 录像阀门（主循环开关录像用） */
-    enc->record_valve = gst_bin_get_by_name(GST_BIN(pipeline), "rv");
+    elem = require_element(pipeline, "rv");
+    if (NULL == elem) {
+        goto error;
+    }
+    enc->record_valve = elem;
+    gst_object_unref(elem);
+    elem = NULL;
 
     /* 预览 appsink 双回调（AI 推理 / UI 显示） */
     memset(&cb, 0, sizeof(cb));
     cb.new_sample = appsink_new_sample;
-    elem = gst_bin_get_by_name(GST_BIN(pipeline), "preview_sink_nv12");
-    if (NULL != elem) {
-        gst_app_sink_set_callbacks(GST_APP_SINK(elem), &cb, enc, NULL);
-        gst_object_unref(elem);
+    elem = require_element(pipeline, "preview_sink_nv12");
+    if (NULL == elem) {
+        goto error;
     }
+    gst_app_sink_set_callbacks(GST_APP_SINK(elem), &cb, enc, NULL);
+    gst_object_unref(elem);
+    elem = NULL;
+
     memset(&cb, 0, sizeof(cb));
     cb.new_sample = appsink_bgra_new_sample;
-    elem = gst_bin_get_by_name(GST_BIN(pipeline), "preview_sink_bgra");
-    if (NULL != elem) {
-        gst_app_sink_set_callbacks(GST_APP_SINK(elem), &cb, enc, NULL);
-        gst_object_unref(elem);
+    elem = require_element(pipeline, "preview_sink_bgra");
+    if (NULL == elem) {
+        goto error;
     }
+    gst_app_sink_set_callbacks(GST_APP_SINK(elem), &cb, enc, NULL);
+    gst_object_unref(elem);
+    elem = NULL;
 
     enc->pipeline = pipeline;
     enc->bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
     return 0;
+
+error:
+    /* 借用引用先清空：管线销毁后这些指针会悬垂 */
+    enc->record_valve = NULL;
+    enc->record_sink  = NULL;
+    gst_object_unref(pipeline);
+    return -1;
 }
 /*****************************************************************************
  * 函数名称：gst_encoder_set_preview_cb
@@ -494,13 +533,13 @@ void gst_encoder_deinit(gst_encoder_t *enc)
     }
 
     if (NULL != enc->pipeline) {
+        /* 借用引用先置空：bin 析构会销毁 valve/sink 元件 */
+        enc->record_valve = NULL;
+        enc->record_sink  = NULL;
+
         /* 幂等：已回 NULL 态时此调用无副作用 */
         gst_element_set_state(enc->pipeline, GST_STATE_NULL);
         gst_object_unref(enc->pipeline);
         enc->pipeline = NULL;
     }
-
-    /* valve/sink 由 bin 析构释放，这里只清引用 */
-    enc->record_valve = NULL;
-    enc->record_sink  = NULL;
 }
