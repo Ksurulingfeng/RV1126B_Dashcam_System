@@ -174,6 +174,7 @@ static int system_init(void)
     enc_config.height      = CAMERA_HEIGHT;
     enc_config.fps         = CAMERA_FPS;
     enc_config.bitrate     = VIDEO_BITRATE;
+    enc_config.audio_enabled = settings_get_audio_enabled();
     if (0 != gst_encoder_init(&s_encoder, &enc_config)) {
         LOG_E("MAIN", "编码器初始化失败");
         goto cleanup;
