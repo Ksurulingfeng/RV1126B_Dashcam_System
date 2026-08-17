@@ -11,11 +11,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <drm/drm.h>
+#include <xf86drm.h>
 
+#include "log.h"
 #include "thumb_pipeline.h"
 #include "settings.h"
 #include "ui_pages.h"
 #include "ui_theme.h"
+#include "display/drm.h"
+
+/* 播放器进程路径（与 deploy.sh 默认部署目录一致） */
+#define UI_PLAYER_PATH "/root/RV1126B_Dashcam_System/dashcam_player"
 
 /* 文件库单页最大显示条目
  * 注意：板端预编译 LVGL 的 LV_MEM_SIZE 仅 48KB，
@@ -243,6 +252,42 @@ done:
 }
 
 /*****************************************************************************
+ * 函数名称：ui_library_row_cb
+ * 功能描述：点击录像卡片——拉起播放器进程全屏回放
+ * 输入参数：@e - LVGL 事件（目标为行卡片对象）
+ * 注意事项：waitpid 阻塞期间 UI 主循环停转，LVGL 不刷新不提交 DRM，
+ *           播放器 kmssink 独占屏幕；播放结束返回后 UI 自动恢复
+ *****************************************************************************/
+static void ui_library_row_cb(lv_event_t* e)
+{
+    lv_obj_t* row = lv_event_get_target(e);
+    const char* path = (const char*)lv_obj_get_user_data(row);
+    pid_t pid;
+
+    if ((NULL == path) || ('\0' == path[0])) {
+        return;
+    }
+
+    LOG_I("UI", "回放：%s", path);
+    pid = fork();
+    if (0 == pid) {
+        /* 子进程：exec 播放器（全屏直出，无需 UI 参与） */
+        (void)execl(UI_PLAYER_PATH, "dashcam_player", path, (char*)NULL);
+        LOG_E("UI", "播放器启动失败");
+        _exit(127);
+    }
+    if (0 < pid) {
+        /* 父进程：等播放结束（期间 LVGL 停刷，不与 kmssink 抢屏） */
+        (void)waitpid(pid, NULL, 0);
+        /* 播放器进程关闭 DRM fd 时释放 master，本进程被降级，
+         * 后续 page flip 失败导致黑屏——显式夺回并强制全屏重绘 */
+        (void)drmSetMaster(getdrmfd());
+        lv_obj_invalidate(lv_scr_act());
+        LOG_I("UI", "回放结束");
+    }
+}
+
+/*****************************************************************************
  * 函数名称：ui_library_add_row
  * 功能描述：向列表容器添加一行录像文件卡片（缩略图 + 文件名 + 元信息）
  * 输入参数：@parent - 列表容器
@@ -335,6 +380,9 @@ static void ui_library_add_row(lv_obj_t* parent, const video_entry_t* entry)
         strcpy(path_copy, entry->filepath);
     }
     lv_obj_set_user_data(row, path_copy);
+
+    /* 点击整行 → 拉起播放器全屏回放 */
+    lv_obj_add_event_cb(row, ui_library_row_cb, LV_EVENT_CLICKED, NULL);
 }
 
 /*****************************************************************************

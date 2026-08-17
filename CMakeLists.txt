@@ -30,6 +30,11 @@ list(FILTER SOURCES EXCLUDE REGEX ".*/test/.*")
 # 参考资料目录（lv_drivers 源码，RGA 专项备用）不参与编译
 list(FILTER SOURCES EXCLUDE REGEX ".*/third_party/.*")
 list(FILTER SOURCES EXCLUDE REGEX ".*_test\\.(c|cc)$")
+# 独立播放器进程（src/player 有独立 main，单独编译成 dashcam_player）
+list(FILTER SOURCES EXCLUDE REGEX ".*/player/.*")
+
+# 录像回放独立进程源码：GStreamer 硬解 + KMS 全屏播放（UI 回放时拉起）
+file(GLOB_RECURSE PLAYER_SOURCES CONFIGURE_DEPENDS "src/player/*.c")
 
 set(OPENCV_LIBS opencv_core opencv_videoio opencv_video opencv_highgui opencv_imgcodecs opencv_imgproc)
 
@@ -57,4 +62,24 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_compile_definitions(${PROJECT_NAME} PRIVATE LV_CONF_INCLUDE_SIMPLE)
 
 target_link_libraries(${PROJECT_NAME} ${OPENCV_LIBS} pthread ${GST_LIBRARIES}
-    ${FFMPEG_LIBRARIES} rknnrt rga lvgl lv_drivers)
+    ${FFMPEG_LIBRARIES} rknnrt rga lvgl lv_drivers drm)
+
+# ===== 录像回放独立进程（LVGL 界面：canvas + 暂停/退出按钮） =====
+# 复用主程序的触摸驱动（touch_input.c 无 UI 依赖，可独立编译）
+add_executable(dashcam_player ${PLAYER_SOURCES} src/ui/touch_input.c)
+
+target_include_directories(dashcam_player PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/common
+    ${CMAKE_SOURCE_DIR}/src/ui
+    ${CMAKE_SOURCE_DIR}/src/third_party/lv_drivers/display
+    ${GST_INCLUDE_DIRS}
+    ${TOOLCHAIN_DIR}/aarch64-buildroot-linux-gnu/sysroot/usr/include/lvgl
+    ${TOOLCHAIN_DIR}/aarch64-buildroot-linux-gnu/sysroot/usr/include/lvgl/lv_drivers
+)
+
+target_compile_definitions(dashcam_player PRIVATE LV_CONF_INCLUDE_SIMPLE)
+
+# drm/freetype：lv_drivers 的 KMS 后端与 lvgl 字体引擎的依赖
+# （主程序靠 OpenCV 间接带入，播放器无 OpenCV 需显式链接）
+target_link_libraries(dashcam_player pthread ${GST_LIBRARIES} lvgl lv_drivers
+    drm freetype)
