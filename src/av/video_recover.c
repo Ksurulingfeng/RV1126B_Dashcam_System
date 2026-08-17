@@ -445,23 +445,28 @@ static int mp4_write_file(const char *out_path, const nal_list_t *list,
     for (i = 0; i < list->count; i++) {
         const nal_item_t *item = &list->items[i];
 
-        /* pkt.data 指向原缓冲的长度前缀处：[4字节长度][NAL] */
-        pkt->data = (uint8_t *)item->data - 4;
-        pkt->size = (int)item->size + 4;
-        pkt->stream_index = st->index;
-        pkt->pts = frames;
-        pkt->dts = frames;
-        if (5 == item->type) {
-            pkt->flags = AV_PKT_FLAG_KEY;
-        } else {
-            pkt->flags = 0;
-        }
-        if (0 > av_interleaved_write_frame(ctx, pkt)) {
-            av_packet_unref(pkt);
-            goto done;
-        }
-        av_packet_unref(pkt);
+        /* 仅写帧 NAL（1 非 IDR 片 / 5 IDR）：
+         * h264parse config-interval 使 mdat 内每个 GOP 前有
+         * SPS/PPS 独立样本，与同帧 IDR 的 dts 相同，mp4 muxer
+         * 严格单调性检查会拒绝；其内容由 avcC（extradata）提供，
+         * 无需重复写入 */
         if ((1 == item->type) || (5 == item->type)) {
+            /* pkt.data 指向原缓冲的长度前缀处：[4字节长度][NAL] */
+            pkt->data = (uint8_t *)item->data - 4;
+            pkt->size = (int)item->size + 4;
+            pkt->stream_index = st->index;
+            pkt->pts = frames;
+            pkt->dts = frames;
+            if (5 == item->type) {
+                pkt->flags = AV_PKT_FLAG_KEY;
+            } else {
+                pkt->flags = 0;
+            }
+            if (0 > av_interleaved_write_frame(ctx, pkt)) {
+                av_packet_unref(pkt);
+                goto done;
+            }
+            av_packet_unref(pkt);
             frames++;
         }
     }

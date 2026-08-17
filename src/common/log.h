@@ -47,14 +47,14 @@
 #define LOG_I(tag, fmt, ...)                                              \
     do {                                                                  \
         if ((LOG_ENABLE) && (LOG_LVL_INFO <= LOG_LEVEL)) {                \
-            printf("[" tag "][I] " fmt "\n", ##__VA_ARGS__);              \
+            fprintf(stderr, "[" tag "][I] " fmt "\n", ##__VA_ARGS__);     \
         }                                                                 \
     } while (0)
 
 #define LOG_D(tag, fmt, ...)                                              \
     do {                                                                  \
         if ((LOG_ENABLE) && (LOG_LVL_DEBUG <= LOG_LEVEL)) {               \
-            printf("[" tag "][D] " fmt "\n", ##__VA_ARGS__);              \
+            fprintf(stderr, "[" tag "][D] " fmt "\n", ##__VA_ARGS__);     \
         }                                                                 \
     } while (0)
 
