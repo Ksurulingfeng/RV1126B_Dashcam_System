@@ -177,8 +177,8 @@ static int build_launch_string(char *buf, size_t size,
         "v4l2src name=camsrc ! "
         "video/x-raw,format=NV12,width=%u,height=%u,framerate=%u/1 ! "
         "tee name=t "
-        "t. ! queue ! mpph264enc bps=%u gop=%u ! "
-        "valve name=rv drop=false ! h264parse ! "
+        "t. ! queue ! mpph264enc bps=%u gop=%u ! tee name=te "
+        "te. ! valve name=rv drop=false ! h264parse ! "
         "splitmuxsink name=mux location=%s/rec_%%05d.mp4 "
         "max-size-time=%llu "
         "t. ! queue name=qp max-size-buffers=%d leaky=%d ! "
@@ -215,6 +215,23 @@ static int build_launch_string(char *buf, size_t size,
         if ((0 > off2) || ((size_t)(off + off2) >= size)) {
             return -1;
         }
+        off += off2;
+    }
+
+    /* 局域网推流分支（启动期开关）：编码流副本 → RTP → UDP。
+     * 用 rtph264pay config-interval 周期插 SPS/PPS（RTP 层标准做法），
+     * 注意不能动编码器 header-mode / h264parse config-interval——
+     * 独立 SPS/PPS 样本会让录像分支 qtmux dts 非单调卡死 */
+    if (config->stream_enabled) {
+        int off2 = snprintf(buf + off, size - (size_t)off,
+            " te. ! queue ! h264parse ! "
+            "rtph264pay config-interval=-1 pt=96 ! "
+            "udpsink host=%s port=%u sync=false ",
+            config->stream_host, config->stream_port);
+        if ((0 > off2) || ((size_t)(off + off2) >= size)) {
+            return -1;
+        }
+        off += off2;
     }
     return 0;
 }
@@ -258,7 +275,7 @@ static int create_record_pipeline(gst_encoder_t *enc,
     GstAppSinkCallbacks cb;
     char launch[2048];
 
-    /* 录音增益（正点原子手册 2.4.5 官方配置） */
+    /* 录音增益 */
     if (config->audio_enabled) {
         setup_audio_gain();
     }

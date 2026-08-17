@@ -180,6 +180,11 @@ static int system_init(void)
     enc_config.fps         = CAMERA_FPS;
     enc_config.bitrate     = VIDEO_BITRATE;
     enc_config.audio_enabled = settings_get_audio_enabled();
+    /* 局域网推流（MPEG-TS over UDP）：目标 Windows 宿主机
+     * 192.168.26.2，同 WiFi 设备用 VLC/ffplay udp://:5000 可收 */
+    enc_config.stream_enabled = true;
+    enc_config.stream_host    = "192.168.26.2";
+    enc_config.stream_port    = 5000;
     if (0 != gst_encoder_init(&s_encoder, &enc_config)) {
         LOG_E("MAIN", "编码器初始化失败");
         goto cleanup;

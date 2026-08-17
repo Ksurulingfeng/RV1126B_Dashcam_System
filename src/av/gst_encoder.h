@@ -26,6 +26,9 @@ typedef struct {
     uint32_t    fps;          /* 帧率 */
     uint32_t    bitrate;       /* 码率（bps），如 8000000 */
     bool        audio_enabled; /* 录音（启动期开关，构建管线时决定） */
+    bool        stream_enabled; /* 局域网推流开关（MPEG-TS over UDP） */
+    const char *stream_host;    /* 推流目标地址（IP/广播，如 192.168.26.255） */
+    uint16_t    stream_port;    /* 推流目标端口（如 5000） */
 } gst_encoder_config_t;
 
 /* 预览帧回调：appsink 收到新帧时调用（GStreamer 内部线程）
