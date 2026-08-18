@@ -10,10 +10,12 @@
 - **断电保护**：短分段兜底 + SIGTERM EOS 优雅封口写 moov 索引；文件库按 moov 封口探测自动隐藏未完成分段
 - **崩溃恢复**：启动时扫描断电残留，容错扫描 mdat 中 H264 流重建 moov（借用同目录完好文件解码配置），救回最后一段录像
 - **音视频双轨录像**：板载咪头 48kHz 单声道 AAC 录音，与视频同封装（mp4mux 音视频双轨 MP4）
+- **录像回放**：LVGL 独立播放器（dashcam_player）——底部进度条拖动 seek + 当前/总时长显示、⏮⏸⏭ ±15s 快进快退/暂停、✕ 退出，文件库点击缩略图全屏回放
+- **局域网推流**：编码流 tee 分路 RTP/UDP，Windows VLC 实时观看；设置页"局域网推流"开关随时启停（valve 数据闸门），不影响录像
 - **紧急锁定保护**：AI 检测到 person 连续 3 帧自动锁定当前分段（`_E` 后缀持久化），循环覆盖永不删除
 - **AI 目标检测**：YOLOv5s 部署于 3.0 TOPS NPU（RKNN INT8 量化），实测约 40fps，检测框实时绘制
 - **触摸交互 UI**：LVGL 8.4 + DRM 90° 旋转，自写 Goodix 电容触摸驱动，多页面架构（主页/录像库/设置）
-- **设置体系**：AI 识别（画框/自动锁定从属联动）、录像、录音、分段时长五项开关，key=value 配置持久化，主循环秒级巡检应用
+- **设置体系**：AI 识别（画框/自动锁定从属联动）、录像、录音、局域网推流等开关与分段时长设定，key=value 配置持久化，主循环秒级巡检应用
 - **GPS 定位**：EC20 4G 模块 NMEA 0183 解析（GGA/RMC），状态栏实时显示
 - **FFmpeg 离线处理**：录像缩略图生成（解码抽帧 → 手写 BMP 落盘），回放/导出/修复的扩展基座
 
@@ -41,16 +43,17 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 实时录像链路（同源 tee 分流 + 低延迟预览 + 断电保护）
+### 实时录像链路（同源 tee 分路：录像 / 局域网推流 / 预览-AI，断电保护）
 
 ```
-IMX415 → v4l2src → capsfilter(NV12/1080P) → tee ─┬→ queue → mpph264enc(硬编码)
-                                                  │     → valve(录像开关) → h264parse
-                                                  │     → splitmuxsink（分段时长可设，
-                                                  │        默认 mp4mux：EOS/切段封口
-                                                  │        写 moov 索引）
-                                                  │       + alsasrc(48k 单声道)
-                                                  │         → AAC → 同段音视频双轨
+IMX415 → v4l2src → capsfilter(NV12/1080P) → tee ─┬→ queue → mpph264enc(硬编码) → tee te
+                                                  │     ├→ valve rv(录像开关) → h264parse → splitmuxsink
+                                                  │     │     （分段时长可设，默认 mp4mux：EOS/切段封口写 moov 索引）
+                                                  │     │   + alsasrc(48k 单声道) → AAC → 同段音视频双轨
+                                                  │     └→ valve sv(推流开关) → h264parse
+                                                  │           → rtph264pay(pt=96, config-interval=-1)
+                                                  │           → udpsink(host=192.168.26.2:5000) → Windows VLC 实时观看
+                                                  │           （关闭开关 VLC 画面停、开启恢复，录像不受影响）
                                                   └→ queue(限1帧丢旧) → videoscale(720p)
                                                         → tee2 ─┬→ appsink(NV12) → AI 推理
                                                                 └→ videoconvert(BGRA)
@@ -59,6 +62,8 @@ IMX415 → v4l2src → capsfilter(NV12/1080P) → tee ─┬→ queue → mpph26
                                     file_mgr 巡检（超限删最旧、_E 锁定保护、
                                                  moov 封口探测隐藏未完成分段）
 ```
+
+`mpph264enc` 输出经 `tee name=te` 一分为二：录像分支走 `valve rv` 分段落盘；推流分支走 `valve sv` → RTP/UDP 实时上送，两分支共用同一编码流。推流启停用 GStreamer `valve` 数据闸门（drop=true 停流、false 恢复），运行时切换对录像零影响。
 
 ### AI 链路
 
@@ -85,7 +90,9 @@ GStreamer tee 预览分支(NV12 720p，与录像同源同视野)
 | 职责 | 技术 |
 |------|------|
 | 实时录像链路（采集→编码→封装→分段） | GStreamer 管线（v4l2src/mpph264enc/splitmuxsink） |
-| 离线文件操作（缩略图/回放/导出/修复） | FFmpeg（libavformat/libavcodec/libswscale） |
+| 录像回放（本地播放器） | GStreamer（mppvideodec 硬解 + appsink → LVGL canvas） |
+| 局域网推流（RTP/UDP 实时上送） | GStreamer（tee 分路 + rtph264pay + udpsink） |
+| 离线文件操作（缩略图/导出/修复） | FFmpeg（libavformat/libavcodec/libswscale） |
 | AI 推理 | RKNN（YOLOv5s INT8，NPU 3.0 TOPS） |
 | 图形界面 | LVGL 8.4 + DRM + freetype 中文字体 |
 | 触摸输入 | 自写 read_cb（Goodix MT Type B 协议解析 + 旋转坐标映射） |
@@ -104,7 +111,8 @@ RV1126B_Dashcam_System/
 │   ├── common/       # 公共组件（thread_mgr + preview_share/detect_share 共享 + settings 配置 + log 日志）
 │   ├── ui/           # 图形界面（LVGL 多页面 + touch_input 触摸驱动）
 │   ├── ai/           # AI 推理（YOLOv5s RKNN + 检测框 + 紧急联动）
-│   ├── network/      # 网络（RTSP 推流、云端上传规划中）
+│   ├── player/       # 独立回放播放器（dashcam_player：进度条 seek/±15s/暂停/退出）
+│   ├── network/      # 网络（RTSP/云端上传规划中；RTP/UDP 推流实现在 av/gst_encoder tee 分支）
 │   └── test/         # 单元测试（PC 端可运行）
 ├── scripts/          # 构建与部署脚本（build.sh / deploy.sh / dashcam_init.sh）
 ├── config/           # 配置文件
