@@ -21,6 +21,8 @@ if(NOT DEFINED ENV{PKG_CONFIG_SYSROOT_DIR})
 endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0)
+# RTSP 实时推流服务器（复用编码流 appsrc 桥接）
+pkg_check_modules(RTSP_SERVER REQUIRED gstreamer-rtsp-server-1.0)
 # FFmpeg（离线文件操作：缩略图/回放/导出/修复）
 pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
 
@@ -52,6 +54,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/src/test
     ${CMAKE_SOURCE_DIR}/src/third_party/lv_drivers/display
     ${GST_INCLUDE_DIRS}
+    ${RTSP_SERVER_INCLUDE_DIRS}
     ${FFMPEG_INCLUDE_DIRS}
     ${TOOLCHAIN_DIR}/aarch64-buildroot-linux-gnu/sysroot/usr/include/rknn
     ${TOOLCHAIN_DIR}/aarch64-buildroot-linux-gnu/sysroot/usr/include/rga
@@ -62,7 +65,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_compile_definitions(${PROJECT_NAME} PRIVATE LV_CONF_INCLUDE_SIMPLE)
 
 target_link_libraries(${PROJECT_NAME} ${OPENCV_LIBS} pthread ${GST_LIBRARIES}
-    ${FFMPEG_LIBRARIES} rknnrt rga lvgl lv_drivers drm)
+    ${RTSP_SERVER_LIBRARIES} ${FFMPEG_LIBRARIES} rknnrt rga lvgl lv_drivers drm)
 
 # ===== 录像回放独立进程（LVGL 界面：canvas + 暂停/退出按钮） =====
 # 复用主程序的触摸驱动（touch_input.c 无 UI 依赖，可独立编译）

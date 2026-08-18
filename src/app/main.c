@@ -19,6 +19,7 @@
 #include "file_mgr.h"
 #include "detect_share.h"
 #include "gst_encoder.h"
+#include "rtsp_server.h"
 #include "gps_worker.h"
 #include "preview_share.h"
 #include "settings.h"
@@ -191,6 +192,8 @@ static int system_init(void)
         goto cleanup;
     }
     s_encoder_ready = true;
+    /* RTSP 实时推流服务器（复用编码流，手机 VLC rtsp://<ip>:8554/stream） */
+    (void)rtsp_server_init();
     /* 开始录像 */
     if (0 != gst_encoder_start(&s_encoder)) {
         LOG_E("MAIN", "编码器启动失败");
@@ -255,6 +258,7 @@ cleanup:
         gst_encoder_stop(&s_encoder);
     }
     gst_encoder_deinit(&s_encoder);
+    rtsp_server_deinit();
     if (s_file_mgr_ready) {
         file_mgr_deinit(&s_file_mgr);
     }
@@ -272,6 +276,7 @@ static void system_deinit(void)
 
     gst_encoder_stop(&s_encoder);
     gst_encoder_deinit(&s_encoder);
+    rtsp_server_deinit();
     file_mgr_deinit(&s_file_mgr);
     /* 预览共享缓冲：线程已全部退出，可安全释放 */
     preview_share_deinit(&s_preview_share);

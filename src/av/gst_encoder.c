@@ -18,6 +18,7 @@
 #include <gst/app/gstappsink.h>
 
 #include "gst_encoder.h"
+#include "rtsp_server.h"
 
 /* 预览分支输出尺寸（tee 分流后缩放，供 AI 推理与 UI 显示，
  * 与 preview_share.h 的 PREVIEW_WIDTH/HEIGHT 保持一致） */
@@ -156,6 +157,34 @@ static GstFlowReturn appsink_bgra_new_sample(GstAppSink *appsink,
 
 
 /*****************************************************************************
+ * 函数名称：appsink_rtsp_new_sample
+ * 功能描述：RTSP appsink 新帧回调——把编码流 buffer 桥接给 RTSP 服务器
+ * 输入参数：@appsink   - 触发回调的 appsink
+ *           @user_data - 未使用
+ * 返回值：  GST_FLOW_OK / GST_FLOW_ERROR
+ * 注意事项：回调在 GStreamer 线程，rtsp_server_push 内部加锁；
+ *           无客户端时直接丢弃（不阻塞管线）
+ *****************************************************************************/
+static GstFlowReturn appsink_rtsp_new_sample(GstAppSink *appsink,
+                                             gpointer user_data)
+{
+    GstSample *sample = NULL;
+
+    (void)appsink;
+    (void)user_data;
+
+    sample = gst_app_sink_pull_sample(appsink);
+    if (NULL == sample) {
+        return GST_FLOW_ERROR;
+    }
+    rtsp_server_push(gst_sample_get_buffer(sample),
+                     gst_sample_get_caps(sample));
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
+}
+
+
+/*****************************************************************************
  * 函数名称：build_launch_string
  * 功能描述：构造 gst_parse_launch 管线描述串
  * 输入参数：@buf    - 输出缓冲
@@ -230,6 +259,22 @@ static int build_launch_string(char *buf, size_t size,
             "rtph264pay config-interval=-1 pt=96 ! "
             "udpsink host=%s port=%u sync=false ",
             config->stream_host, config->stream_port);
+        if ((0 > off2) || ((size_t)(off + off2) >= size)) {
+            return -1;
+        }
+        off += off2;
+    }
+
+    /* RTSP 推流分支（常开，独立于 UDP 推流开关）：编码流副本 →
+     * appsink → RTSP 服务器（rtsp_server_push 桥接），手机/电脑
+     * VLC 打开 rtsp://<ip>:8554/stream 免 sdp 实时观看。
+     * config-interval=-1 每关键帧插 SPS/PPS 独立样本——主程序编码流
+     * 中途接入，首帧参数集已过，RTSP 客户端要靠周期参数集才能解码；
+     * 注意仅此分支安全（下游只有 appsink，无 muxer 卡 dts） */
+    {
+        int off2 = snprintf(buf + off, size - (size_t)off,
+            " te. ! queue ! h264parse config-interval=-1 "
+            "! appsink name=rtsp_sink sync=false drop=true max-buffers=2 ");
         if ((0 > off2) || ((size_t)(off + off2) >= size)) {
             return -1;
         }
@@ -348,6 +393,17 @@ static int create_record_pipeline(gst_encoder_t *enc,
     memset(&cb, 0, sizeof(cb));
     cb.new_sample = appsink_bgra_new_sample;
     elem = require_element(pipeline, "preview_sink_bgra");
+    if (NULL == elem) {
+        goto error;
+    }
+    gst_app_sink_set_callbacks(GST_APP_SINK(elem), &cb, enc, NULL);
+    gst_object_unref(elem);
+    elem = NULL;
+
+    /* RTSP 推流 appsink 回调（编码流桥接 → RTSP 服务器） */
+    memset(&cb, 0, sizeof(cb));
+    cb.new_sample = appsink_rtsp_new_sample;
+    elem = require_element(pipeline, "rtsp_sink");
     if (NULL == elem) {
         goto error;
     }
