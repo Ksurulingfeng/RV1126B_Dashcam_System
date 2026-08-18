@@ -692,6 +692,7 @@ typedef enum {
     SETTINGS_SW_AI_LOCK, /* person 紧急自动锁定 */
     SETTINGS_SW_RECORD,  /* 录像 */
     SETTINGS_SW_AUDIO,   /* 录音（启动期生效） */
+    SETTINGS_SW_STREAM,  /* 局域网推流 */
 } settings_sw_id_t;
 
 /*****************************************************************************
@@ -738,6 +739,9 @@ static void settings_switch_cb(lv_event_t* e)
             break;
         case SETTINGS_SW_AUDIO:
             settings_set_audio_enabled(on);
+            break;
+        case SETTINGS_SW_STREAM:
+            settings_set_stream_enabled(on);
             break;
         default:
             break;
@@ -945,6 +949,9 @@ lv_obj_t* ui_page_settings_create(ui_worker_t* ui)
     ui_settings_add_switch(card, "录音（重启生效）",
                            settings_get_audio_enabled(),
                            SETTINGS_SW_AUDIO);
+    ui_settings_add_switch(card, "局域网推流",
+                           settings_get_stream_enabled(),
+                           SETTINGS_SW_STREAM);
 
     /* 录像参数分组 */
     card = ui_settings_group_create(scroll, "录像参数");

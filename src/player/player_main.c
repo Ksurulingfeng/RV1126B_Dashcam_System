@@ -58,6 +58,13 @@ static lv_obj_t *s_canvas;          /* 全屏视频 canvas（底层） */
 static lv_color_t *s_canvas_buf;    /* canvas 帧缓冲（BGRA 直拷） */
 static lv_obj_t *s_btn_pause;       /* 暂停/继续按钮 */
 static lv_obj_t *s_btn_pause_label; /* 按钮图标（暂停/播放切换） */
+static lv_obj_t *s_slider;          /* 底部进度条 */
+static lv_obj_t *s_time_label;      /* 当前/总时长文本 */
+static bool s_is_seeking = false;   /* 拖动进度条中（暂停进度刷新） */
+static gint64 s_duration_ns = 0;    /* 当前文件总时长（0=未查询） */
+
+/* 快退/快进步进（秒） */
+#define PLAYER_SKIP_SEC 15
 
 /*****************************************************************************
  * 函数名称：on_sigterm
@@ -108,8 +115,82 @@ static void btn_pause_cb(lv_event_t *e)
 }
 
 /*****************************************************************************
+ * 函数名称：fmt_time
+ * 功能描述：纳秒时间戳格式化为 mm:ss 文本
+ * 输出参数：@buf  - 输出缓冲
+ * 输入参数：@size - 缓冲大小
+ *           @ns   - 纳秒时间戳
+ *****************************************************************************/
+static void fmt_time(char *buf, size_t size, gint64 ns)
+{
+    long long sec = (long long)(ns / GST_SECOND);
+
+    (void)snprintf(buf, size, "%02lld:%02lld", sec / 60, sec % 60);
+}
+
+/*****************************************************************************
+ * 函数名称：seek_to
+ * 功能描述：跳转到指定时间点（越界钳制到 [0, 总时长]）
+ * 输入参数：@target_ns - 目标纳秒时间戳
+ *****************************************************************************/
+static void seek_to(gint64 target_ns)
+{
+    if (0 > target_ns) {
+        target_ns = 0;
+    }
+    if ((0 < s_duration_ns) && (target_ns > s_duration_ns)) {
+        target_ns = s_duration_ns;
+    }
+    if (!gst_element_seek(s_pipeline, 1.0, GST_FORMAT_TIME,
+                          GST_SEEK_FLAG_FLUSH, GST_SEEK_TYPE_SET, target_ns,
+                          GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE)) {
+        LOG_W(TAG_PLAYER, "seek 失败");
+    }
+}
+
+/*****************************************************************************
+ * 函数名称：btn_skip_cb
+ * 功能描述：快退/快进按钮——按 user_data 方向跳 ±15 秒
+ * 输入参数：@e - 事件（user_data 为 +1 快进 / -1 快退）
+ *****************************************************************************/
+static void btn_skip_cb(lv_event_t *e)
+{
+    int dir = (int)(intptr_t)lv_event_get_user_data(e);
+    gint64 pos = 0;
+
+    if (NULL == s_pipeline) {
+        return;
+    }
+    if (gst_element_query_position(s_pipeline, GST_FORMAT_TIME, &pos)) {
+        seek_to(pos + (gint64)dir * PLAYER_SKIP_SEC * GST_SECOND);
+        LOG_I(TAG_PLAYER, "跳转 %+d 秒", dir * PLAYER_SKIP_SEC);
+    }
+}
+
+/*****************************************************************************
+ * 函数名称：slider_seek_cb
+ * 功能描述：进度条事件——按下标记拖动中（暂停进度刷新），
+ *           释放后按 slider 值跳转
+ * 输入参数：@e - 事件
+ *****************************************************************************/
+static void slider_seek_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+
+    if (LV_EVENT_PRESSING == lv_event_get_code(e)) {
+        s_is_seeking = true;
+    } else if (LV_EVENT_RELEASED == lv_event_get_code(e)) {
+        s_is_seeking = false;
+        if (NULL != s_pipeline) {
+            seek_to((gint64)lv_slider_get_value(slider) * GST_SECOND);
+        }
+    }
+}
+
+/*****************************************************************************
  * 函数名称：ui_build
- * 功能描述：构建播放界面——全屏 canvas + 右上退出 + 右下暂停按钮
+ * 功能描述：构建播放界面——全屏 canvas + 右上退出 +
+ *           底部进度条（快退|暂停|快进 按钮行）
  * 注意事项：按钮浮于 canvas 上层；canvas 缓冲外部 malloc（LVGL 池够用）
  *****************************************************************************/
 static void ui_build(void)
@@ -134,23 +215,76 @@ static void ui_build(void)
     btn = lv_btn_create(lv_scr_act());
     lv_obj_set_size(btn, PLAYER_BTN_SIZE, PLAYER_BTN_SIZE);
     lv_obj_align(btn, LV_ALIGN_TOP_RIGHT, -16, 16);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0xFF2D55), 0);
+    /* 透明背景 + 白描边框（与其他按钮风格统一） */
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(0xF5F7FA), 0);
+    lv_obj_set_style_border_width(btn, 2, 0);
     lv_obj_set_style_radius(btn, 16, 0);
     lv_obj_add_event_cb(btn, btn_exit_cb, LV_EVENT_CLICKED, NULL);
     label = lv_label_create(btn);
     lv_obj_center(label);
     lv_label_set_text(label, LV_SYMBOL_CLOSE);
 
-    /* 暂停/继续按钮：右下角深灰底 */
+    /* 底部进度条（最底层控件，全宽） */
+    s_slider = lv_slider_create(lv_scr_act());
+    lv_obj_set_size(s_slider, lv_pct(100), 44);
+    lv_obj_align(s_slider, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(s_slider, lv_color_hex(0x0B0F14), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_slider, lv_color_hex(0x22D3EE),
+                              LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_slider, lv_color_hex(0xF5F7FA),
+                              LV_PART_KNOB);
+    lv_obj_add_event_cb(s_slider, slider_seek_cb, LV_EVENT_ALL, NULL);
+
+    /* 时间标签：左下角（进度条上方） */
+    s_time_label = lv_label_create(lv_scr_act());
+    lv_obj_align(s_time_label, LV_ALIGN_BOTTOM_LEFT, 16, -52);
+    lv_obj_set_style_text_color(s_time_label, lv_color_hex(0xF5F7FA), 0);
+    lv_label_set_text(s_time_label, "00:00 / 00:00");
+
+    /* 暂停/继续按钮：底部中间，进度条上方 */
     s_btn_pause = lv_btn_create(lv_scr_act());
     lv_obj_set_size(s_btn_pause, PLAYER_BTN_SIZE, PLAYER_BTN_SIZE);
-    lv_obj_align(s_btn_pause, LV_ALIGN_BOTTOM_RIGHT, -16, -16);
-    lv_obj_set_style_bg_color(s_btn_pause, lv_color_hex(0x161D26), 0);
+    lv_obj_align(s_btn_pause, LV_ALIGN_BOTTOM_MID, 0, -64);
+    /* 透明背景 + 白描边框（框住图标，不遮视频画面） */
+    lv_obj_set_style_bg_opa(s_btn_pause, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(s_btn_pause, lv_color_hex(0xF5F7FA), 0);
+    lv_obj_set_style_border_width(s_btn_pause, 2, 0);
     lv_obj_set_style_radius(s_btn_pause, 16, 0);
     lv_obj_add_event_cb(s_btn_pause, btn_pause_cb, LV_EVENT_CLICKED, NULL);
     s_btn_pause_label = lv_label_create(s_btn_pause);
     lv_obj_center(s_btn_pause_label);
     lv_label_set_text(s_btn_pause_label, LV_SYMBOL_PAUSE);
+
+    /* 快退按钮：暂停左侧（user_data=-1） */
+    btn = lv_btn_create(lv_scr_act());
+    lv_obj_set_size(btn, PLAYER_BTN_SIZE, PLAYER_BTN_SIZE);
+    lv_obj_align_to(btn, s_btn_pause, LV_ALIGN_OUT_LEFT_MID, -12, 0);
+    /* 透明背景 + 白描边框（框住图标，不遮视频画面） */
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(0xF5F7FA), 0);
+    lv_obj_set_style_border_width(btn, 2, 0);
+    lv_obj_set_style_radius(btn, 16, 0);
+    lv_obj_add_event_cb(btn, btn_skip_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)(-1));
+    label = lv_label_create(btn);
+    lv_obj_center(label);
+    lv_label_set_text(label, LV_SYMBOL_PREV);
+
+    /* 快进按钮：暂停右侧（user_data=+1） */
+    btn = lv_btn_create(lv_scr_act());
+    lv_obj_set_size(btn, PLAYER_BTN_SIZE, PLAYER_BTN_SIZE);
+    lv_obj_align_to(btn, s_btn_pause, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
+    /* 透明背景 + 白描边框（框住图标，不遮视频画面） */
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(btn, lv_color_hex(0xF5F7FA), 0);
+    lv_obj_set_style_border_width(btn, 2, 0);
+    lv_obj_set_style_radius(btn, 16, 0);
+    lv_obj_add_event_cb(btn, btn_skip_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)(1));
+    label = lv_label_create(btn);
+    lv_obj_center(label);
+    lv_label_set_text(label, LV_SYMBOL_NEXT);
 }
 
 /*****************************************************************************
@@ -235,6 +369,10 @@ static int play_file(const char *path)
     s_appsink = (GstAppSink *)gst_bin_get_by_name(GST_BIN(pipeline), "sink");
     s_is_paused = false;
     s_is_stop_requested = 0;
+    s_is_seeking = false;
+    s_duration_ns = 0;
+    lv_slider_set_value(s_slider, 0, LV_ANIM_OFF);
+    lv_label_set_text(s_time_label, "00:00 / 00:00");
     memset(s_canvas_buf, 0, sizeof(lv_color_t) *
            PLAYER_SCREEN_W * PLAYER_SCREEN_H);
     lv_obj_invalidate(s_canvas);
@@ -273,8 +411,41 @@ static int play_file(const char *path)
             break;
         }
 
-        /* 帧泵 + LVGL 刷新（按钮/触摸在此驱动） */
+        /* 帧泵 + 进度刷新 + LVGL 刷新（按钮/触摸在此驱动） */
         pump_frame();
+        {
+            gint64 pos = 0;
+
+            /* 首次成功查询后缓存总时长（seek 钳制用） */
+            if (0 == s_duration_ns) {
+                (void)gst_element_query_duration(pipeline,
+                                                 GST_FORMAT_TIME,
+                                                 &s_duration_ns);
+            }
+            if (gst_element_query_position(pipeline, GST_FORMAT_TIME,
+                                           &pos)) {
+                if (false == s_is_seeking) {
+                    lv_slider_set_value(s_slider,
+                                        (int32_t)(pos / GST_SECOND),
+                                        LV_ANIM_OFF);
+                }
+                if (NULL != s_time_label) {
+                    char cur[16];
+                    char total[16];
+                    char line[40];
+
+                    fmt_time(cur, sizeof(cur), pos);
+                    if (0 < s_duration_ns) {
+                        fmt_time(total, sizeof(total), s_duration_ns);
+                    } else {
+                        (void)strncpy(total, "--:--", sizeof(total));
+                        total[sizeof(total) - 1] = '\0';
+                    }
+                    (void)snprintf(line, sizeof(line), "%s / %s", cur, total);
+                    lv_label_set_text(s_time_label, line);
+                }
+            }
+        }
         {
             uint32_t wait_ms = lv_timer_handler();
 

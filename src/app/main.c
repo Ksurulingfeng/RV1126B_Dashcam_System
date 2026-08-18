@@ -67,6 +67,7 @@ static volatile bool s_is_running = true;
 
 /* 设置应用巡检记忆值（变化时应用到编码器） */
 static bool s_last_record_enabled = true;
+static bool s_last_stream_enabled = true;
 static uint32_t s_last_segment_sec = 0;
 
 /* 配置文件路径 */
@@ -338,6 +339,11 @@ int main(int argc, char* argv[])
             gst_encoder_set_record_enabled(&s_encoder,
                                            settings_get_record_enabled());
             s_last_record_enabled = settings_get_record_enabled();
+        }
+        if (settings_get_stream_enabled() != s_last_stream_enabled) {
+            gst_encoder_set_stream_enabled(&s_encoder,
+                                           settings_get_stream_enabled());
+            s_last_stream_enabled = settings_get_stream_enabled();
         }
         if (settings_get_segment_sec() != s_last_segment_sec) {
             gst_encoder_set_segment_sec(&s_encoder,

@@ -20,6 +20,7 @@ typedef struct {
     bool     ai_auto_lock;   /* person 紧急自动锁定开关 */
     bool     record_enabled; /* 录像开关（GStreamer valve 控制） */
     bool     audio_enabled;  /* 录音开关（占位：音频链路未实现） */
+    bool     stream_enabled; /* 局域网推流开关（RTP/UDP valve 控制） */
     uint32_t segment_sec;    /* 分段时长（秒） */
 } settings_t;
 
@@ -54,6 +55,8 @@ bool settings_get_record_enabled(void);
 void settings_set_record_enabled(bool on);
 bool settings_get_audio_enabled(void);
 void settings_set_audio_enabled(bool on);
+bool settings_get_stream_enabled(void);
+void settings_set_stream_enabled(bool on);
 uint32_t settings_get_segment_sec(void);
 void settings_set_segment_sec(uint32_t sec);
 

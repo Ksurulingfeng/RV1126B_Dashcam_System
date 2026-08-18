@@ -97,6 +97,11 @@ static int settings_load_file(void)
                     s_settings.audio_enabled = bool_val;
                     loaded++;
                 }
+            } else if (0 == strcmp(key, "stream_enabled")) {
+                if (parse_bool(value, &bool_val)) {
+                    s_settings.stream_enabled = bool_val;
+                    loaded++;
+                }
             } else if (0 == strcmp(key, "segment_sec")) {
                 if ((1 == sscanf(value, "%u", &sec)) && (0 < sec)) {
                     s_settings.segment_sec = sec;
@@ -151,6 +156,7 @@ int settings_init(const char *conf_path)
     s_settings.ai_auto_lock  = true;
     s_settings.record_enabled = true;
     s_settings.audio_enabled = false;
+    s_settings.stream_enabled = true;
     s_settings.segment_sec   = DEFAULT_SEGMENT_SEC;
 
     if (0 != settings_load_file()) {
@@ -189,6 +195,8 @@ int settings_save(void)
         fprintf(fp, "record_enabled=%d\n",
                 s_settings.record_enabled ? 1 : 0);
         fprintf(fp, "audio_enabled=%d\n", s_settings.audio_enabled ? 1 : 0);
+        fprintf(fp, "stream_enabled=%d\n",
+                s_settings.stream_enabled ? 1 : 0);
         fprintf(fp, "segment_sec=%u\n", s_settings.segment_sec);
         fclose(fp);
     }
@@ -344,6 +352,36 @@ void settings_set_audio_enabled(bool on)
 {
     pthread_mutex_lock(&s_mutex);
     s_settings.audio_enabled = on;
+    pthread_mutex_unlock(&s_mutex);
+}
+
+
+/*****************************************************************************
+ * 函数名称：settings_get_stream_enabled
+ * 功能描述：读取局域网推流开关
+ * 返回值：  开启返回 true
+ * 注意事项：推流分支 valve 控制，运行期改动 ≤1 秒生效
+ *****************************************************************************/
+bool settings_get_stream_enabled(void)
+{
+    bool on;
+
+    pthread_mutex_lock(&s_mutex);
+    on = s_settings.stream_enabled;
+    pthread_mutex_unlock(&s_mutex);
+    return on;
+}
+
+
+/*****************************************************************************
+ * 函数名称：settings_set_stream_enabled
+ * 功能描述：设置局域网推流开关
+ * 输入参数：@on - 是否开启
+ *****************************************************************************/
+void settings_set_stream_enabled(bool on)
+{
+    pthread_mutex_lock(&s_mutex);
+    s_settings.stream_enabled = on;
     pthread_mutex_unlock(&s_mutex);
 }
 

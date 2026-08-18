@@ -43,6 +43,7 @@ typedef struct {
     GstBus     *bus;           /* 消息总线（错误/EOS 监控） */
     GstElement *record_valve;  /* 录像阀门（tee→valve→编码，开关录像用） */
     GstElement *record_sink;   /* splitmuxsink（运行时调分段时长） */
+    GstElement *stream_valve;  /* 推流阀门（开关局域网推流用） */
     gst_preview_frame_cb preview_cb;       /* NV12 预览帧回调（AI 推理） */
     void *preview_user_data;               /* NV12 回调上下文 */
     gst_preview_frame_cb preview_bgra_cb;  /* BGRA 预览帧回调（UI 显示） */
@@ -115,6 +116,15 @@ void gst_encoder_deinit(gst_encoder_t *enc);
  *           @enabled - 是否录像
  *****************************************************************************/
 void gst_encoder_set_record_enabled(gst_encoder_t *enc, bool enabled);
+
+/*****************************************************************************
+ * 函数名称：gst_encoder_set_stream_enabled
+ * 功能描述：局域网推流开关（valve 数据闸门：关闭时推流暂停、
+ *           重开无缝恢复；不影响录像）
+ * 输入参数：@enc     - 编码器上下文
+ *           @enabled - 是否推流
+ *****************************************************************************/
+void gst_encoder_set_stream_enabled(gst_encoder_t *enc, bool enabled);
 
 /*****************************************************************************
  * 函数名称：gst_encoder_set_segment_sec

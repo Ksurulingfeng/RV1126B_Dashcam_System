@@ -221,10 +221,12 @@ static int build_launch_string(char *buf, size_t size,
     /* 局域网推流分支（启动期开关）：编码流副本 → RTP → UDP。
      * 用 rtph264pay config-interval 周期插 SPS/PPS（RTP 层标准做法），
      * 注意不能动编码器 header-mode / h264parse config-interval——
-     * 独立 SPS/PPS 样本会让录像分支 qtmux dts 非单调卡死 */
+     * 独立 SPS/PPS 样本会让录像分支 qtmux dts 非单调卡死。
+     * valve name=sv：运行时推流开关（drop 停推流，不影响录像） */
     if (config->stream_enabled) {
         int off2 = snprintf(buf + off, size - (size_t)off,
             " te. ! queue ! h264parse ! "
+            "valve name=sv drop=false ! "
             "rtph264pay config-interval=-1 pt=96 ! "
             "udpsink host=%s port=%u sync=false ",
             config->stream_host, config->stream_port);
@@ -320,6 +322,18 @@ static int create_record_pipeline(gst_encoder_t *enc,
     gst_object_unref(elem);
     elem = NULL;
 
+    /* 推流阀门（主循环开关推流用；仅推流分支启用时存在） */
+    enc->stream_valve = NULL;
+    if (config->stream_enabled) {
+        elem = require_element(pipeline, "sv");
+        if (NULL == elem) {
+            goto error;
+        }
+        enc->stream_valve = elem;
+        gst_object_unref(elem);
+        elem = NULL;
+    }
+
     /* 预览 appsink 双回调（AI 推理 / UI 显示） */
     memset(&cb, 0, sizeof(cb));
     cb.new_sample = appsink_new_sample;
@@ -349,6 +363,7 @@ error:
     /* 借用引用先清空：管线销毁后这些指针会悬垂 */
     enc->record_valve = NULL;
     enc->record_sink  = NULL;
+    enc->stream_valve = NULL;
     gst_object_unref(pipeline);
     return -1;
 }
@@ -514,6 +529,26 @@ void gst_encoder_set_record_enabled(gst_encoder_t *enc, bool enabled)
 
 
 /*****************************************************************************
+ * 函数名称：gst_encoder_set_stream_enabled
+ * 功能描述：局域网推流开关（valve 数据闸门：关闭时推流暂停，
+ *           重开无缝恢复；不影响录像）
+ * 输入参数：@enc     - 编码器上下文
+ *           @enabled - 是否推流
+ *****************************************************************************/
+void gst_encoder_set_stream_enabled(gst_encoder_t *enc, bool enabled)
+{
+    if ((NULL == enc) || (NULL == enc->stream_valve)) {
+        return;
+    }
+
+    /* valve drop=true 时 RTP 推流分支停止输出（接收端短暂黑屏），
+     * 重开后立即续推，录像分支不受影响 */
+    g_object_set(G_OBJECT(enc->stream_valve), "drop", !enabled, NULL);
+    LOG_I("GST", "推流%s", enabled ? "开启" : "关闭");
+}
+
+
+/*****************************************************************************
  * 函数名称：gst_encoder_set_segment_sec
  * 功能描述：运行时调整分段时长（splitmuxsink max-size-time）
  * 输入参数：@enc - 编码器上下文
@@ -553,6 +588,7 @@ void gst_encoder_deinit(gst_encoder_t *enc)
         /* 借用引用先置空：bin 析构会销毁 valve/sink 元件 */
         enc->record_valve = NULL;
         enc->record_sink  = NULL;
+        enc->stream_valve = NULL;
 
         /* 幂等：已回 NULL 态时此调用无副作用 */
         gst_element_set_state(enc->pipeline, GST_STATE_NULL);
