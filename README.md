@@ -11,7 +11,7 @@
 - **崩溃恢复**：启动时扫描断电残留，容错扫描 mdat 中 H264 流重建 moov（借用同目录完好文件解码配置），救回最后一段录像
 - **音视频双轨录像**：板载咪头 48kHz 单声道 AAC 录音，与视频同封装（mp4mux 音视频双轨 MP4）
 - **录像回放**：LVGL 独立播放器（dashcam_player）——底部进度条拖动 seek + 当前/总时长显示、⏮⏸⏭ ±15s 快进快退/暂停、✕ 退出，文件库点击缩略图全屏回放
-- **局域网推流**：编码流 tee 分路 RTP/UDP，Windows VLC 实时观看；设置页"局域网推流"开关随时启停（valve 数据闸门），不影响录像
+- **局域网推流**：编码流 tee 分路双通道——RTP/UDP 实时上送（VLC/ffplay 收 sdp）+ RTSP 服务器（内嵌 gst-rtsp-server，VLC/手机**免 sdp** 打开 `rtsp://ip:8554/stream` 实时观看）；设置页"局域网推流"开关随时启停（valve 数据闸门），不影响录像
 - **紧急锁定保护**：AI 检测到 person 连续 3 帧自动锁定当前分段（`_E` 后缀持久化），循环覆盖永不删除
 - **AI 目标检测**：YOLOv5s 部署于 3.0 TOPS NPU（RKNN INT8 量化），实测约 40fps，检测框实时绘制
 - **触摸交互 UI**：LVGL 8.4 + DRM 90° 旋转，自写 Goodix 电容触摸驱动，多页面架构（主页/录像库/设置）
@@ -29,9 +29,11 @@
 │  gst_encoder │ file_mgr │ gps_worker │ ai_worker │ ui_main    │
 │  thumb_gen   │ preview_share │ detect_share │ thread_mgr       │
 │  touch_input │ log（分级日志）                                  │
+│  rtsp_server（RTSP 实时推流：appsrc 桥接 + GLib 主循环线程）     │
 ├─────────────────────────────────────────────────────────────┤
 │ 框架层：                                                       │
 │  GStreamer（实时链路：v4l2src/mpph264enc/splitmuxsink）        │
+│  gst-rtsp-server（RTSP 服务器：8554/stream 免 sdp）            │
 │  FFmpeg（离线文件操作：demux/decode/scale）                    │
 │  LVGL + DRM（图形界面与触摸交互）                              │
 ├─────────────────────────────────────────────────────────────┤
@@ -50,10 +52,13 @@ IMX415 → v4l2src → capsfilter(NV12/1080P) → tee ─┬→ queue → mpph26
                                                   │     ├→ valve rv(录像开关) → h264parse → splitmuxsink
                                                   │     │     （分段时长可设，默认 mp4mux：EOS/切段封口写 moov 索引）
                                                   │     │   + alsasrc(48k 单声道) → AAC → 同段音视频双轨
-                                                  │     └→ valve sv(推流开关) → h264parse
-                                                  │           → rtph264pay(pt=96, config-interval=-1)
-                                                  │           → udpsink(host=192.168.26.2:5000) → Windows VLC 实时观看
-                                                  │           （关闭开关 VLC 画面停、开启恢复，录像不受影响）
+                                                  │     ├→ valve sv(推流开关) → h264parse
+                                                  │     │     → rtph264pay(pt=96, config-interval=-1)
+                                                  │     │     → udpsink(host=192.168.26.2:5000) → VLC/ffplay 实时观看
+                                                  │     │     （关闭开关 VLC 画面停、开启恢复，录像不受影响）
+                                                  │     └→ h264parse(config-interval=-1) → appsink(rtsp_sink)
+                                                  │           → rtsp_server_push → RTSP 服务器(8554/stream)
+                                                  │           → VLC/手机 免 sdp 实时观看
                                                   └→ queue(限1帧丢旧) → videoscale(720p)
                                                         → tee2 ─┬→ appsink(NV12) → AI 推理
                                                                 └→ videoconvert(BGRA)
@@ -63,7 +68,7 @@ IMX415 → v4l2src → capsfilter(NV12/1080P) → tee ─┬→ queue → mpph26
                                                  moov 封口探测隐藏未完成分段）
 ```
 
-`mpph264enc` 输出经 `tee name=te` 一分为二：录像分支走 `valve rv` 分段落盘；推流分支走 `valve sv` → RTP/UDP 实时上送，两分支共用同一编码流。推流启停用 GStreamer `valve` 数据闸门（drop=true 停流、false 恢复），运行时切换对录像零影响。
+`mpph264enc` 输出经 `tee name=te` 一分为三：录像分支走 `valve rv` 分段落盘；推流分支走 `valve sv` → RTP/UDP 实时上送（可开关）；RTSP 分支常开，appsink → appsrc 桥接进内嵌 gst-rtsp-server（8554/stream），客户端 VLC/手机免 sdp 直连。三路共用同一编码流，互不影响。推流启停用 GStreamer `valve` 数据闸门（drop=true 停流、false 恢复），运行时切换对录像零影响。
 
 ### AI 链路
 
@@ -92,6 +97,7 @@ GStreamer tee 预览分支(NV12 720p，与录像同源同视野)
 | 实时录像链路（采集→编码→封装→分段） | GStreamer 管线（v4l2src/mpph264enc/splitmuxsink） |
 | 录像回放（本地播放器） | GStreamer（mppvideodec 硬解 + appsink → LVGL canvas） |
 | 局域网推流（RTP/UDP 实时上送） | GStreamer（tee 分路 + rtph264pay + udpsink） |
+| RTSP 实时推流（免 sdp 直连） | gst-rtsp-server（appsrc 桥接编码流 + rtph264pay，内嵌主程序 8554/stream） |
 | 离线文件操作（缩略图/导出/修复） | FFmpeg（libavformat/libavcodec/libswscale） |
 | AI 推理 | RKNN（YOLOv5s INT8，NPU 3.0 TOPS） |
 | 图形界面 | LVGL 8.4 + DRM + freetype 中文字体 |
@@ -105,14 +111,14 @@ GStreamer tee 预览分支(NV12 720p，与录像同源同视野)
 RV1126B_Dashcam_System/
 ├── src/
 │   ├── app/          # 程序入口（信号处理、模块组装、巡检循环）
-│   ├── av/           # 音视频（gst_encoder 分段录像 + thumb_gen 缩略图 + video_recover 断电恢复）
+│   ├── av/           # 音视频（gst_encoder 分段录像 + rtsp_server RTSP 推流 + thumb_gen 缩略图 + video_recover 断电恢复）
 │   ├── core/         # 核心业务（file_mgr 目录守护：锁定/巡检删除）
 │   ├── gps/          # GPS（nmea_parser 解析 + gps_worker 线程）
 │   ├── common/       # 公共组件（thread_mgr + preview_share/detect_share 共享 + settings 配置 + log 日志）
 │   ├── ui/           # 图形界面（LVGL 多页面 + touch_input 触摸驱动）
 │   ├── ai/           # AI 推理（YOLOv5s RKNN + 检测框 + 紧急联动）
 │   ├── player/       # 独立回放播放器（dashcam_player：进度条 seek/±15s/暂停/退出）
-│   ├── network/      # 网络（RTSP/云端上传规划中；RTP/UDP 推流实现在 av/gst_encoder tee 分支）
+│   ├── network/      # 网络（云端上传规划中；RTP/UDP 推流在 av/gst_encoder tee 分支，RTSP 服务器在 av/rtsp_server）
 │   └── test/         # 单元测试（PC 端可运行）
 ├── scripts/          # 构建与部署脚本（build.sh / deploy.sh / dashcam_init.sh）
 ├── config/           # 配置文件
