@@ -74,3 +74,70 @@
 - 优先用清晰的命名代替过多注释。
 
 <!-- huawei-c:end -->
+
+<!-- project-guide:start -->
+
+## 常用命令
+
+### 交叉编译（RV1126B 交叉工具链）
+```bash
+./scripts/build.sh          # Release 编译（CMake + Ninja，产物 build/RV1126B_Dashcam_System、build/dashcam_player）
+./scripts/build.sh -d       # Debug
+./scripts/build.sh -c       # 清理后重编
+```
+
+### 部署到开发板（adb 连接 ATK-DLRV1126B）
+```bash
+./scripts/deploy.sh -n -r   # 部署并重启程序（-i 安装开机自启 S50dashcam）
+```
+板端程序目录 `/root/RV1126B_Dashcam_System`，录像目录 `/mnt/sdcard/videos`。
+
+### PC 单元测试（src/test/ 不参与 CMake，手动 gcc）
+```bash
+# 例：video_recover 恢复测试（PC 可跑，无需开发板）
+gcc -o /tmp/test_recover -I src/common -I src/av \
+    src/test/test_video_recover.c src/av/video_recover.c \
+    $(pkg-config --cflags --libs libavformat libavcodec libavutil)
+```
+`test_file_mgr.c`、`test_nmea.c`、`test_thumb_gen.c` 同法（对应 src/core、src/gps、src/av）。
+
+## 架构概览
+
+### 两个可执行文件
+| 目标 | 源码 | 职责 |
+|------|------|------|
+| `RV1126B_Dashcam_System` | [src/app/main.c](src/app/main.c) + 各模块 | 主程序：录像/断电恢复/UI/AI/GPS/推流 |
+| `dashcam_player` | [src/player/player_main.c](src/player/player_main.c) + [src/ui/touch_input.c](src/ui/touch_input.c) | 独立回放播放器（LVGL 界面，UI fork 拉起） |
+
+### GStreamer 实时管线（[src/av/gst_encoder.c](src/av/gst_encoder.c)）
+`parse-launch` 字符串构建（板端实测**手写 API 会致 mux 不输出 0 字节，勿改**）：
+```
+v4l2src → capsfilter → tee t
+  t → queue → mpph264enc → tee te
+     te → valve rv → h264parse → splitmuxsink（录像分支）
+     te → queue → h264parse → valve sv → rtph264pay → udpsink（推流分支）
+  t → queue → videoscale → tee t2 → appsink nv12/bgra（预览分支）
+```
+- `valve` 是录像/推流的运行时开关（`drop` 属性），UI 改 settings → 主循环巡检 ≤1s 应用
+- 推流 RTP 用 `rtph264pay config-interval=-1` 周期插 SPS/PPS；**禁止**动编码器 `header-mode` 或 h264parse `config-interval`（独立 SPS/PPS 样本会让 qtmux/mpegtsmux dts 非单调卡死）
+- 播放器/推流踩坑详见记忆 `rtsp-streaming-pitfalls` 与 `fmp4-fragment-unsolved`
+
+### 设置-巡检模式（[src/common/settings.c](src/common/settings.c) + main.c）
+- UI 只写 settings（key=value 持久化 + 互斥锁），主循环每秒巡检变化后调 gst_encoder 接口
+- 启动期生效项（录音/推流分支构建）在 `gst_encoder_config_t`；运行期项（录像/推流/分段时长）走 valve/max-size-time
+
+### 断电恢复（[src/av/video_recover.c](src/av/video_recover.c)）
+- 启动时扫描断电残留（mdat 无 moov），AVCC 长度前缀格式零拷贝重封装 + 借用同目录完好文件 avcC + 连续两帧验证过滤伪命中
+
+### LVGL UI（[src/ui/](src/ui/)）
+- [ui_main.c](src/ui/ui_main.c)：LVGL + DRM 显示（`drm_disp_drv_init` 旋转 90° 逻辑横屏 1280×720）、`lv_timer_handler` 主循环
+- [ui_pages.c](src/ui/ui_pages.c)：文件库（缩略图后台管线）/设置页/点击行拉起播放器（fork + waitpid，期间 LVGL 停刷避免抢屏，结束后 `drmSetMaster` 恢复显示）
+- [touch_input.c](src/ui/touch_input.c)：自写 /dev/input/event1 MT 读取（O_NONBLOCK + read_cb，非 LVGL 官方 evdev）
+
+### 关键约定
+- 代码注释/文档用简体中文；commit `<type>: 中文描述`；作者署名 heifast
+- `docs/` 在 .gitignore（本地归档不入库）；README.md 入 git
+- 华为 C 规范仅约束 .c/.h；`src/third_party/`（lv_drivers 参考源码）豁免
+- 板端坑（详见记忆）：SIGKILL 丢缓冲日志（LOG 已改 stderr）；pkill 按 15 字符截断匹配失败；adb shell 后台启动用 `setsid`；ffplay 收自己发的广播不回环
+
+<!-- project-guide:end -->
