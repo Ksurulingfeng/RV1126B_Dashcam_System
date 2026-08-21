@@ -211,6 +211,7 @@ static int build_launch_string(char *buf, size_t size,
         "splitmuxsink name=mux location=%s/rec_%%05d.mp4 "
         "max-size-time=%llu "
         "t. ! queue name=qp max-size-buffers=%d leaky=%d ! "
+        "videorate ! video/x-raw,framerate=15/1 ! "
         "videoscale ! tee name=t2 "
         "t2. ! queue name=qn max-size-buffers=%d leaky=%d ! "
         "video/x-raw,format=NV12,width=%d,height=%d ! "

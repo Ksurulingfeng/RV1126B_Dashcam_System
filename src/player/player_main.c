@@ -34,8 +34,8 @@
  * mppvideodec 硬解 → videoconvert(RGA 转 BGRA) → videoscale 缩到
  * 逻辑屏 1280×720（LVGL 逻辑横屏，与主程序一致，视频等比全屏） */
 #define PLAYER_LAUNCH_STR \
-    "filesrc location=%s ! qtdemux ! h264parse ! mppvideodec " \
-    "! videoconvert ! videoscale ! video/x-raw,format=BGRA," \
+    "filesrc location=%s ! qtdemux name=demux ! h264parse name=parse " \
+    "! mppvideodec ! videoconvert ! videoscale ! video/x-raw,format=BGRA," \
     "width=1280,height=720 ! appsink name=sink"
 
 /* 逻辑屏幕尺寸（drm_disp_drv_init 旋转 90° 后，与主程序一致） */
@@ -288,6 +288,90 @@ static void ui_build(void)
 }
 
 /*****************************************************************************
+ * 函数名称：rd32 / rd64
+ * 功能描述：大端读取 4/8 字节无符号整数（MP4 box 字段）
+ * 输入参数：@p - 数据指针
+ * 返回值：  读取的数值
+ *****************************************************************************/
+static uint32_t rd32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
+           | ((uint32_t)p[2] << 8) | p[3];
+}
+
+static uint64_t rd64(const uint8_t *p)
+{
+    return ((uint64_t)rd32(p) << 32) | rd32(p + 4);
+}
+
+/*****************************************************************************
+ * 函数名称：mp4_duration_ns
+ * 功能描述：解析 MP4 moov→mvhd 拿总时长（纳秒）
+ * 输入参数：@path - MP4 文件路径
+ * 返回值：  总时长（纳秒），失败返回 0
+ * 注意事项：GStreamer 板端 duration query/segment 均不可靠，
+ *           mvhd 的 timescale + duration 是唯一可靠来源（约 30 行）
+ *****************************************************************************/
+static gint64 mp4_duration_ns(const char *path)
+{
+    FILE *fp = fopen(path, "rb");
+    uint8_t hdr[8];
+    gint64 dur_ns = 0;
+
+    if (NULL == fp) {
+        LOG_W(TAG_PLAYER, "mp4 打开失败");
+        return 0;
+    }
+    /* 顶层 box：跳过 mdat 等大 box，找 moov */
+    while (8 == fread(hdr, 1, 8, fp)) {
+        uint32_t size = rd32(hdr);
+
+        if (0 == memcmp(hdr + 4, "moov", 4)) {
+            /* 进 moov 找 mvhd */
+            while (8 == fread(hdr, 1, 8, fp)) {
+                uint32_t sub = rd32(hdr);
+
+                if (0 == memcmp(hdr + 4, "mvhd", 4)) {
+                    uint8_t mv[32];
+                    long n = (long)(sub - 8);
+                    uint32_t timescale = 0;
+                    uint64_t duration = 0;
+
+                    if (n > (long)sizeof(mv)) {
+                        n = (long)sizeof(mv);
+                    }
+                    if ((n > 0) && ((long)fread(mv, 1, (size_t)n, fp) == n)) {
+                        if (0 == mv[0]) { /* version 0 */
+                            timescale = rd32(mv + 12);
+                            duration = rd32(mv + 16);
+                        } else {          /* version 1 */
+                            timescale = rd32(mv + 20);
+                            duration = rd64(mv + 24);
+                        }
+                    }
+                    if (0 < timescale) {
+                        dur_ns = (gint64)(duration * GST_SECOND / timescale);
+                    }
+                    fclose(fp);
+                    return dur_ns;
+                }
+                if (sub < 8) {
+                    break;
+                }
+                fseek(fp, (long)sub - 8, SEEK_CUR);
+            }
+            break;
+        }
+        if (size < 8) {
+            break;
+        }
+        fseek(fp, (long)size - 8, SEEK_CUR);
+    }
+    fclose(fp);
+    return 0;
+}
+
+/*****************************************************************************
  * 函数名称：pump_frame
  * 功能描述：从 appsink 拉取最新帧（丢旧帧），BGRA 直拷 canvas 并刷新
  * 注意事项：循环拉空缓冲只保留最后一帧，追不上帧率时主动丢帧
@@ -370,7 +454,9 @@ static int play_file(const char *path)
     s_is_paused = false;
     s_is_stop_requested = 0;
     s_is_seeking = false;
-    s_duration_ns = 0;
+    s_duration_ns = mp4_duration_ns(path); /* 直接解析 mvhd 拿总时长 */
+    LOG_I(TAG_PLAYER, "总时长 %lld 秒",
+          (long long)(s_duration_ns / GST_SECOND));
     lv_slider_set_value(s_slider, 0, LV_ANIM_OFF);
     lv_label_set_text(s_time_label, "00:00 / 00:00");
     memset(s_canvas_buf, 0, sizeof(lv_color_t) *
@@ -417,11 +503,6 @@ static int play_file(const char *path)
             gint64 pos = 0;
 
             /* 首次成功查询后缓存总时长（seek 钳制用） */
-            if (0 == s_duration_ns) {
-                (void)gst_element_query_duration(pipeline,
-                                                 GST_FORMAT_TIME,
-                                                 &s_duration_ns);
-            }
             if (gst_element_query_position(pipeline, GST_FORMAT_TIME,
                                            &pos)) {
                 if (false == s_is_seeking) {
